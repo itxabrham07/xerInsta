@@ -4,7 +4,9 @@ export const config = {
     password: 'your_instagram_password', // Your Instagram password
     useMongoSession: true // Set to false to use file-based sessions
   },
-  
+  messageRequests: {
+  autoApprove: true, // Auto-approve all message requests
+},
   telegram: {
     botToken: '7580382614:AAH30PW6TFmgRzbC7HUXIHQ35GpndbJOIEI',
     chatId: '-1002287300661',
