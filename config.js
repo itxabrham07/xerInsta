@@ -16,7 +16,7 @@ export const config = {
   
   mongo: {
     uri: 'mongodb+srv://itxelijah07:ivp8FYGsbVfjQOkj@cluster0.wh25x.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0',
-    dbName: 'hyper_insta',
+    dbName: 'hyper_instza',
     options: {
       useNewUrlParser: true,
       useUnifiedTopology: true
