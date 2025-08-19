@@ -1,4 +1,3 @@
-
 import { IgApiClient } from 'instagram-private-api';
 import { withRealtime } from 'instagram_mqtt';
 import { GraphQLSubscriptions, SkywalkerSubscriptions } from 'instagram_mqtt';
@@ -22,6 +21,7 @@ class InstagramBot {
     this.lastMessageCheck = new Date(Date.now() - 60000);
     this.processedMessageIds = new Set();
     this.maxProcessedMessageIds = 1000;
+    this.userCache = new Map(); // Cache for user info
   }
 
   /**
@@ -173,36 +173,35 @@ class InstagramBot {
       await this.handleMessage(data.message, data);
     });
 
-    // Handle other direct events
+    // Handle other direct events (potential fallback for message requests)
     this.ig.realtime.on('direct', async (data) => {
       if (data.message && this.isNewMessageById(data.message.item_id)) {
         await this.handleMessage(data.message, data);
       } else {
-        this.log('INFO', 'Received non-message direct event');
+        this.log('DEBUG', 'Received non-message direct event:', JSON.stringify(data, null, 2));
       }
     });
 
-    // Handle thread updates for message requests if autoApprove is enabled
-    if (config.messageRequests?.autoApprove) {
-      this.ig.realtime.on('threadUpdate', async (data) => {
-        try {
-          if (data.update?.pending) {
-            this.log('INFO', `New message request detected in thread ${data.update.thread_id || data.update.thread_v2_id}`);
-            await this.handleMessageRequest(data.update);
-          }
-        } catch (error) {
-          this.log('ERROR', 'Error handling thread update:', error.message);
+    // Handle thread updates for message requests
+    this.ig.realtime.on('threadUpdate', async (data) => {
+      try {
+        this.log('DEBUG', 'Received threadUpdate event:', JSON.stringify(data, null, 2));
+        if (data.update?.pending && config.messageRequests?.autoApprove) {
+          this.log('INFO', `New message request detected in thread ${data.update.thread_id || data.update.thread_v2_id}`);
+          await this.handleMessageRequest(data.update);
+        } else {
+          this.log('DEBUG', 'Thread update (non-pending or autoApprove disabled)', JSON.stringify(data.update, null, 2));
         }
-      });
-    } else {
-      this.log('INFO', 'Message request auto-approval disabled in config');
-    }
+      } catch (error) {
+        this.log('ERROR', 'Error handling thread update:', error.message);
+      }
+    });
 
     // General receive event for debugging
     this.ig.realtime.on('receive', (topic, messages) => {
       const topicStr = String(topic || '');
       if (topicStr.includes('direct') || topicStr.includes('message') || topicStr.includes('iris')) {
-        this.log('DEBUG', `Received on topic: ${topicStr}`);
+        this.log('DEBUG', `Received on topic: ${topicStr}`, JSON.stringify(messages, null, 2));
       }
     });
 
@@ -248,6 +247,28 @@ class InstagramBot {
   }
 
   /**
+   * Fetches username for a user ID, using cache or API.
+   * @param {string} userId - The Instagram user ID.
+   * @returns {string} The username or fallback ID.
+   */
+  async getUsername(userId) {
+    if (!userId) return `user_${userId || 'unknown'}`;
+    if (this.userCache.has(userId)) {
+      return this.userCache.get(userId);
+    }
+    try {
+      const userInfo = await this.ig.user.info(userId);
+      const username = userInfo.username || `user_${userId}`;
+      this.userCache.set(userId, username);
+      this.log('DEBUG', `Fetched username ${username} for user ID ${userId}`);
+      return username;
+    } catch (error) {
+      this.log('ERROR', `Failed to fetch username for user ID ${userId}:`, error.message);
+      return `user_${userId}`;
+    }
+  }
+
+  /**
    * Handles incoming messages.
    * @param {object} message - The message object.
    * @param {object} eventData - Additional event data.
@@ -262,7 +283,13 @@ class InstagramBot {
       let senderUsername = `user_${message.user_id}`;
       if (eventData.thread?.users) {
         const sender = eventData.thread.users.find(u => u.pk?.toString() === message.user_id?.toString());
-        if (sender?.username) senderUsername = sender.username;
+        if (sender?.username) {
+          senderUsername = sender.username;
+        } else {
+          senderUsername = await this.getUsername(message.user_id);
+        }
+      } else {
+        senderUsername = await this.getUsername(message.user_id);
       }
 
       const processedMessage = {
@@ -299,7 +326,7 @@ class InstagramBot {
       }
 
       const threadId = threadUpdate.thread_id || threadUpdate.thread_v2_id;
-      const senderUsername = threadUpdate.users?.[0]?.username || 'unknown';
+      const senderUsername = threadUpdate.users?.[0]?.username || await this.getUsername(threadUpdate.users?.[0]?.pk);
 
       if (config.messageRequests?.autoApprove) {
         await this.approveMessageRequest(threadId);
@@ -515,9 +542,6 @@ async function main() {
 
     const messageHandler = new MessageHandler(bot, moduleManager, null);
     bot.onMessage((message) => messageHandler.handleMessage(message));
-
-    // Example: Send an audio message to a thread (replace with actual threadId and audio file)
-    // await bot.sendAudioMessage('thread_id_here', './path/to/audio.mp3');
 
     console.log('Bot is running with full module support. Type .help for commands.');
 
