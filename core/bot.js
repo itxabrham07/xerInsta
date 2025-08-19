@@ -475,6 +475,20 @@ async loadCookiesFromJson(path = './cookies.json') {
     }
   }
 
+
+  async sendPhoto(threadId, photoPath, caption = '') {
+    try {
+      await this.ig.entity.directThread(threadId).broadcastPhoto({
+        file: photoPath,
+        caption: caption
+      });
+      this.log('INFO', `📷 Photo sent to thread ${threadId}`);
+      return true;
+    } catch (error) {
+      this.log('ERROR', `❌ Error sending photo to thread ${threadId}: ${error.message}`);
+      throw error;
+    }
+  }
   // --- Methods for Missing Features from Example ---
 
   // Subscribe to live comments on a specific broadcast
