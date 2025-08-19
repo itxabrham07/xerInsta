@@ -355,22 +355,26 @@ class InstagramBot {
       let audioBuffer;
       if (typeof audio === 'string') {
         this.log('INFO', `Reading audio file from ${audio}`);
+        // Validate audio format for file paths
+        const validExtensions = ['.mp3', '.m4a', '.wav', '.ogg'];
+        if (!validExtensions.some(ext => audio.toLowerCase().endsWith(ext))) {
+          throw new Error('Unsupported audio format. Use MP3, M4A, WAV, or OGG.');
+        }
         audioBuffer = await fs.readFile(audio);
       } else if (Buffer.isBuffer(audio)) {
+        this.log('INFO', 'Using provided audio buffer');
         audioBuffer = audio;
       } else {
         throw new Error('Audio must be a file path or Buffer');
       }
 
-      // Validate audio format (basic check for size and extension if file path)
-      if (typeof audio === 'string') {
-        const validExtensions = ['.mp3', '.m4a', '.wav'];
-        if (!validExtensions.some(ext => audio.toLowerCase().endsWith(ext))) {
-          throw new Error('Unsupported audio format. Use MP3, M4A, or WAV.');
-        }
-        if (audioBuffer.length > 10 * 1024 * 1024) { // 10MB limit
-          throw new Error('Audio file exceeds 10MB limit');
-        }
+      // Validate audio buffer size
+      if (audioBuffer.length > 10 * 1024 * 1024) { // 10MB limit
+        throw new Error('Audio file exceeds 10MB limit');
+      }
+
+      if (audioBuffer.length === 0) {
+        throw new Error('Audio buffer is empty');
       }
 
       // Simulate mobile metadata if enabled
@@ -378,6 +382,7 @@ class InstagramBot {
         ? { device_id: this.ig.state.deviceId, is_voice: true }
         : {};
 
+      this.log('INFO', `Sending audio buffer of ${audioBuffer.length} bytes to thread ${threadId}`);
       await this.ig.entity.directThread(threadId).broadcastVoice(audioBuffer, options);
       this.log('INFO', `Audio message sent to thread ${threadId}`);
       return true;
