@@ -351,31 +351,7 @@ class TelegramBridge {
         }
     }
 
-    async handleTelegramVoice(msg, instagramThreadId) {
-        try {
-            await this.setReaction(msg.chat.id, msg.message_id, '🔄');
 
-            const fileId = msg.voice.file_id;
-            logger.info(`📥 Downloading voice message from Telegram`);
-            
-            const fileLink = await this.telegramBot.getFileLink(fileId);
-            const response = await axios.get(fileLink, { responseType: 'arraybuffer' });
-            const buffer = Buffer.from(response.data);
-
-            // Send voice message to Instagram
-            const sendResult = await this.instagramBot.sendAudioMessage(instagramThreadId, buffer);
-            
-            if (sendResult) {
-                logger.info(`✅ Successfully sent voice message to Instagram thread ${instagramThreadId}`);
-                await this.setReaction(msg.chat.id, msg.message_id, '👍');
-            } else {
-                throw new Error('Instagram voice send failed');
-            }
-        } catch (error) {
-            logger.error(`❌ Failed to handle/send Telegram voice to Instagram:`, error.message);
-            await this.setReaction(msg.chat.id, msg.message_id, '❌');
-        }
-    }
 
     async setReaction(chatId, messageId, emoji) {
         try {
