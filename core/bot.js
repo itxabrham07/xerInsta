@@ -360,57 +360,7 @@ class InstagramBot {
     }
   }
 
-  /**
-   * Sends an audio message to a thread, simulating a mobile-recorded voice message.
-   * @param {string} threadId - The thread ID.
-   * @param {string|Buffer} audio - Path to the audio file or Buffer containing audio data.
-   * @returns {boolean} True if sent successfully.
-   */
-  async sendAudioMessage(threadId, audio) {
-    if (!threadId || !audio) {
-      this.log('WARN', 'Missing threadId or audio data');
-      throw new Error('Thread ID and audio data are required');
-    }
-    try {
-      let audioBuffer;
-      if (typeof audio === 'string') {
-        this.log('INFO', `Reading audio file from ${audio}`);
-        // Validate audio format for file paths
-        const validExtensions = ['.mp3', '.m4a', '.wav', '.ogg'];
-        if (!validExtensions.some(ext => audio.toLowerCase().endsWith(ext))) {
-          throw new Error('Unsupported audio format. Use MP3, M4A, WAV, or OGG.');
-        }
-        audioBuffer = await fs.readFile(audio);
-      } else if (Buffer.isBuffer(audio)) {
-        this.log('INFO', 'Using provided audio buffer');
-        audioBuffer = audio;
-      } else {
-        throw new Error('Audio must be a file path or Buffer');
-      }
 
-      // Validate audio buffer size
-      if (audioBuffer.length > 10 * 1024 * 1024) { // 10MB limit
-        throw new Error('Audio file exceeds 10MB limit');
-      }
-
-      if (audioBuffer.length === 0) {
-        throw new Error('Audio buffer is empty');
-      }
-
-      // Simulate mobile metadata if enabled
-      const options = config.audioMessages?.simulateMobile
-        ? { device_id: this.ig.state.deviceId, is_voice: true }
-        : {};
-
-      this.log('INFO', `Sending audio buffer of ${audioBuffer.length} bytes to thread ${threadId}`);
-      await this.ig.entity.directThread(threadId).broadcastVoice(audioBuffer, options);
-      this.log('INFO', `Audio message sent to thread ${threadId}`);
-      return true;
-    } catch (error) {
-      this.log('ERROR', `Error sending audio message to thread ${threadId}:`, error.message);
-      throw error;
-    }
-  }
 
   /**
    * Registers a message handler.
@@ -474,27 +424,6 @@ class InstagramBot {
     }
   }
 
-  /**
-   * Subscribes to live comments for a broadcast.
-   * @param {string} broadcastId - The broadcast ID.
-   * @returns {boolean} True if subscription is successful.
-   */
-  async subscribeToLiveComments(broadcastId) {
-    if (!broadcastId) {
-      this.log('WARN', 'Missing broadcastId');
-      return false;
-    }
-    try {
-      await this.ig.realtime.graphQlSubscribe(
-        GraphQLSubscriptions.getLiveRealtimeCommentsSubscription(broadcastId)
-      );
-      this.log('INFO', `Subscribed to live comments for broadcast: ${broadcastId}`);
-      return true;
-    } catch (error) {
-      this.log('ERROR', `Failed to subscribe to live comments: ${broadcastId}`, error.message);
-      return false;
-    }
-  }
 
   /**
    * Sets the app/device foreground state to simulate mobile activity.
