@@ -13,54 +13,53 @@ class HyperInsta {
     this.telegramBridge = config.telegram?.enabled ? new TelegramBridge() : null;
   }
 
-  async initialize() {
-    try {
-      this.showStartupBanner();
+ async initialize() {
+  try {
+    this.showStartupBanner();
 
-      console.log('🗄️ Connecting to MongoDB...');
-      await connectDb();
-      console.log('✅ MongoDB connected');
+    console.log('🗄️ Connecting to MongoDB...');
+    await connectDb();
+    console.log('✅ MongoDB connected');
 
-      console.log('📱 Connecting to Instagram...');
-      await this.instagramBot.login();
-      console.log('✅ Instagram connected');
+    console.log('📱 Connecting to Instagram...');
+    await this.instagramBot.login();
+    console.log('✅ Instagram connected');
+    console.log('DEBUG: InstagramBot ig property exists:', !!this.instagramBot.ig); // Debug log
 
-      if (this.telegramBridge) {
-        console.log('📨 Initializing Telegram...');
-        await this.telegramBridge.initialize();
-        console.log('✅ Telegram connected');
-      }
-
-      console.log('🔌 Loading modules...');
-      const moduleManager = new ModuleManager(this.instagramBot);
-      await moduleManager.loadModules();
-      console.log('✅ Modules loaded');
-
-      console.log('📨 Initializing message handler...');
-      const messageHandler = new MessageHandler(this.instagramBot, moduleManager, this.telegramBridge);
-      this.instagramBot.onMessage((message) => messageHandler.handleMessage(message));
-      console.log('✅ Message handler connected');
-
-      // Log message request auto-approval status
-      console.log(`🔔 Message request auto-approval: ${config.messageRequests?.autoApprove ? 'Enabled' : 'Disabled'}`);
-
-      console.log('✅ Bot is now LIVE and ready!');
-      this.showLiveStatus();
-
-    } catch (error) {
-      console.error(`❌ Startup failed: ${error.message}`);
-      console.debug(error.stack);
-      // Attempt cleanup
-      if (this.instagramBot) {
-        try {
-          await this.instagramBot.disconnect();
-        } catch (disconnectError) {
-          console.error('❌ Error during cleanup disconnect:', disconnectError.message);
-        }
-      }
-      process.exit(1);
+    if (this.telegramBridge) {
+      console.log('📨 Initializing Telegram...');
+      console.log('DEBUG: Passing instagramBot to TelegramBridge:', !!this.instagramBot, !!this.instagramBot.ig);
+      await this.telegramBridge.initialize(this.instagramBot);
+      console.log('✅ Telegram connected');
     }
+
+    console.log('🔌 Loading modules...');
+    const moduleManager = new ModuleManager(this.instagramBot);
+    await moduleManager.loadModules();
+    console.log('✅ Modules loaded');
+
+    console.log('📨 Initializing message handler...');
+    const messageHandler = new MessageHandler(this.instagramBot, moduleManager, this.telegramBridge);
+    this.instagramBot.onMessage((message) => messageHandler.handleMessage(message));
+    console.log('✅ Message handler connected');
+
+    console.log(`🔔 Message request auto-approval: ${config.messageRequests?.autoApprove ? 'Enabled' : 'Disabled'}`);
+    console.log('✅ Bot is now LIVE and ready!');
+    this.showLiveStatus();
+
+  } catch (error) {
+    console.error(`❌ Startup failed: ${error.message}`);
+    console.debug(error.stack);
+    if (this.instagramBot) {
+      try {
+        await this.instagramBot.disconnect();
+      } catch (disconnectError) {
+        console.error('❌ Error during cleanup disconnect:', disconnectError.message);
+      }
+    }
+    process.exit(1);
   }
+}
 
   showStartupBanner() {
     console.log(`
