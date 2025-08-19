@@ -7,6 +7,9 @@ export const config = {
   messageRequests: {
     autoApprove: true, // Auto-approve all message requests if true
   },
+  audioMessages: {
+    simulateMobile: true, // Simulate mobile device metadata for audio messages
+  },
   telegram: {
     botToken: '7580382614:AAH30PW6TFmgRzbC7HUXIHQ35GpndbJOIEI',
     chatId: '-1002287300661',
