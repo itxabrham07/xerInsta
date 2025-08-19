@@ -17,7 +17,6 @@ class HyperInsta {
     try {
       this.showStartupBanner();
 
-
       console.log('🗄️ Connecting to MongoDB...');
       await connectDb();
       console.log('✅ MongoDB connected');
@@ -42,8 +41,8 @@ class HyperInsta {
       this.instagramBot.onMessage((message) => messageHandler.handleMessage(message));
       console.log('✅ Message handler connected');
 
-      await this.instagramBot.startMessageRequestsMonitor(config.messageRequestInterval || 300000);
-      console.log('🕒 Message request monitor started');
+      // Log message request auto-approval status
+      console.log(`🔔 Message request auto-approval: ${config.messageRequests?.autoApprove ? 'Enabled' : 'Disabled'}`);
 
       console.log('✅ Bot is now LIVE and ready!');
       this.showLiveStatus();
@@ -62,7 +61,6 @@ class HyperInsta {
       process.exit(1);
     }
   }
-
 
   showStartupBanner() {
     console.log(`
