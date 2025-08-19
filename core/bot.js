@@ -186,11 +186,28 @@ class InstagramBot {
     this.ig.realtime.on('threadUpdate', async (data) => {
       try {
         this.log('DEBUG', 'Received threadUpdate event:', JSON.stringify(data, null, 2));
-        if (data.update?.pending && config.messageRequests?.autoApprove) {
+        
+        // Check for pending message requests
+        if (data.update && (data.update.pending || data.update.thread_id || data.update.thread_v2_id)) {
           this.log('INFO', `New message request detected in thread ${data.update.thread_id || data.update.thread_v2_id}`);
           await this.handleMessageRequest(data.update);
-        } else {
-          this.log('DEBUG', 'Thread update (non-pending or autoApprove disabled)', JSON.stringify(data.update, null, 2));
+        }
+        
+        // Also check for new messages in the thread update that might need approval
+        if (data.update?.items && Array.isArray(data.update.items)) {
+          for (const item of data.update.items) {
+            if (item.item_type === 'text' && this.isNewMessageById(item.item_id)) {
+              // This might be a message from a pending thread, try to approve it
+              const threadId = data.update.thread_id || data.update.thread_v2_id;
+              if (threadId && config.messageRequests?.autoApprove) {
+                await this.approveMessageRequest(threadId);
+                this.log('INFO', `Auto-approved thread ${threadId} due to new message`);
+              }
+              
+              // Process the message normally
+              await this.handleMessage(item, { thread: data.update });
+            }
+          }
         }
       } catch (error) {
         this.log('ERROR', 'Error handling thread update:', error.message);
@@ -326,12 +343,15 @@ class InstagramBot {
       }
 
       const threadId = threadUpdate.thread_id || threadUpdate.thread_v2_id;
-      const senderUsername = threadUpdate.users?.[0]?.username || await this.getUsername(threadUpdate.users?.[0]?.pk);
+      const senderId = threadUpdate.users?.[0]?.pk;
+      const senderUsername = threadUpdate.users?.[0]?.username || (senderId ? await this.getUsername(senderId) : 'unknown');
 
       if (config.messageRequests?.autoApprove) {
-        await this.approveMessageRequest(threadId);
-        await this.sendMessage(threadId, 'Your message request has been approved.');
-        this.log('INFO', `Auto-approved message request from @${senderUsername} in thread ${threadId}`);
+        const approved = await this.approveMessageRequest(threadId);
+        if (approved) {
+          // Don't send a confirmation message, just log the approval
+          this.log('INFO', `Auto-approved message request from @${senderUsername} in thread ${threadId}`);
+        }
       } else {
         this.log('INFO', `Message request from @${senderUsername} in thread ${threadId} not auto-approved (config disabled)`);
       }
@@ -416,7 +436,15 @@ class InstagramBot {
       return false;
     }
     try {
-      await this.ig.directThread.approve(threadId);
+      // Try multiple methods to approve the message request
+      try {
+        await this.ig.directThread.approve(threadId);
+      } catch (approveError) {
+        this.log('WARN', `Direct approve failed, trying alternative method: ${approveError.message}`);
+        // Alternative method using the thread entity
+        const thread = this.ig.entity.directThread(threadId);
+        await thread.approve();
+      }
       this.log('INFO', `Approved message request: ${threadId}`);
       return true;
     } catch (error) {
