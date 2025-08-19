@@ -5,8 +5,8 @@ export const config = {
     useMongoSession: true // Set to false to use file-based sessions
   },
   messageRequests: {
-  autoApprove: true, // Auto-approve all message requests
-},
+    autoApprove: true, // Auto-approve all message requests if true
+  },
   telegram: {
     botToken: '7580382614:AAH30PW6TFmgRzbC7HUXIHQ35GpndbJOIEI',
     chatId: '-1002287300661',
