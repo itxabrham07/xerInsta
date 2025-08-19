@@ -1,4 +1,3 @@
-// telegram/bridge.js
 import TelegramBot from 'node-telegram-bot-api';
 import fs from 'fs-extra';
 import path from 'path';
@@ -6,7 +5,7 @@ import axios from 'axios';
 import mime from 'mime-types';
 import { connectDb } from '../utils/db.js';
 import { config } from '../config.js';
-import { logger } from '../utils/utils.js'; // Assuming you have a logger utility
+import { logger } from '../utils/utils.js'; 
 
 class TelegramBridge {
     constructor() {
@@ -744,8 +743,6 @@ async sendWelcomeMessage(topicId, instagramThreadId, senderUserId, initialProfil
             await this.setReaction(msg.chat.id, msg.message_id, '❌');
         }
     }
-
-
     async setReaction(chatId, messageId, emoji) {
         try {
             const token = config.telegram?.botToken;
