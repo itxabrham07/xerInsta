@@ -1,4 +1,4 @@
-import { IgApiClient, IgLoginTwoFactorRequiredError, IgCheckpointError } from 'instagram-private-api';
+import { IgApiClient } from 'instagram-private-api';
 import { withRealtime } from 'instagram_mqtt';
 import { GraphQLSubscriptions, SkywalkerSubscriptions } from 'instagram_mqtt';
 import { promises as fs } from 'fs';
@@ -22,21 +22,11 @@ class InstagramBot {
     this.processedMessageIds = new Set();
     this.maxProcessedMessageIds = 1000;
     this.userCache = new Map(); // Cache for user info
-    
-    // File paths for persistence
     this.paths = {
+      device: './device.json',
       session: './session.json',
       cookies: './cookies.json',
-      device: './device.json'
     };
-  }
-
-  /**
-   * Sleep utility function
-   * @param {number} ms - Milliseconds to sleep
-   */
-  sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   /**
@@ -87,16 +77,15 @@ class InstagramBot {
   }
 
   // ---------- Login Flow ----------
-  /**
-   * Enhanced login method with device persistence and structured flow
-   * @throws {Error} If login fails due to missing credentials or invalid session/cookies.
-   */
   async login() {
     const username = config.instagram?.username;
     const password = config.instagram?.password;
     const forceFresh = Boolean(config.instagram?.forceFreshLogin);
 
-    if (!username) throw new Error('INSTAGRAM_USERNAME is missing');
+    if (!username) {
+      this.log('ERROR', 'INSTAGRAM_USERNAME is missing');
+      throw new Error('INSTAGRAM_USERNAME is missing');
+    }
 
     await this.initDevice(username);
 
@@ -117,15 +106,19 @@ class InstagramBot {
     }
 
     // 3) Fresh login
-    if (!password) throw new Error('No valid login method; set instagram.password for fresh login.');
+    if (!password) {
+      this.log('ERROR', 'No valid login method; set instagram.password for fresh login.');
+      throw new Error('No valid login method; set instagram.password for fresh login.');
+    }
     await this.freshLogin(username, password);
     await this.postLogin();
   }
 
   async trySessionLogin() {
     try {
-      const raw = await fs.readFile(this.paths.session, 'utf-8');
-      const sessionData = JSON.parse(raw);
+      await fs.access(this.paths.session);
+      this.log('INFO', 'Found session.json, attempting session-based login...');
+      const sessionData = JSON.parse(await fs.readFile(this.paths.session, 'utf-8'));
       await this.ig.state.deserialize(sessionData);
       await this.ig.account.currentUser();
       this.log('INFO', 'Logged in using session.json');
@@ -161,8 +154,14 @@ class InstagramBot {
       
       await this.saveSession();
     } catch (err) {
+      // 2FA flow
+      if (err.name === 'IgLoginTwoFactorRequiredError') {
+        await this.handleTwoFactorLogin(err, username, password);
+        return;
+      }
+
       // Checkpoint flow (review/verify)
-      if (err instanceof IgCheckpointError || err?.name === 'IgCheckpointError') {
+      if (err.name === 'IgCheckpointError') {
         this.log('WARN', 'Checkpoint required. Attempting auto-resolution...');
         try {
           await this.ig.challenge.auto(true);
@@ -175,8 +174,51 @@ class InstagramBot {
         }
       }
 
+      this.log('ERROR', `Fresh login failed: ${err?.message || err}`);
       throw err;
     }
+  }
+
+  async handleTwoFactorLogin(error, username, password) {
+    const { two_factor_info: info } = error;
+    const identifier = info?.two_factor_identifier;
+    const totp = info?.totp_two_factor_on;
+
+    if (!identifier) {
+      this.log('ERROR', '2FA required but no identifier provided by Instagram.');
+      throw new Error('2FA required but no identifier provided by Instagram.');
+    }
+
+    let code = (config.instagram?.twoFactorCode || '').toString().trim();
+
+    if (!code && totp && config.instagram?.totpSecret) {
+      try {
+        const { totp: totpGen } = await import('otplib');
+        code = totpGen.generate(config.instagram.totpSecret);
+        this.log('INFO', 'Generated TOTP code via otplib.');
+      } catch {
+        this.log('WARN', 'otplib not installed; cannot auto-generate TOTP. Provide instagram.twoFactorCode or install otplib.');
+      }
+    }
+
+    if (!code) {
+      this.log('ERROR', '2FA code required. Set config.instagram.twoFactorCode or instagram.totpSecret (+ otplib).');
+      throw new Error('2FA code required. Set config.instagram.twoFactorCode or instagram.totpSecret (+ otplib).');
+    }
+
+    const method = totp ? '0' : String(info?.sms_two_factor_on ? 1 : 0);
+
+    await this.ig.account.twoFactorLogin({
+      username,
+      password,
+      twoFactorIdentifier: identifier,
+      verificationCode: code,
+      verificationMethod: method,
+      trustThisDevice: true,
+    });
+
+    this.log('INFO', '2FA login successful.');
+    await this.saveSession();
   }
 
   async saveSession() {
@@ -187,62 +229,73 @@ class InstagramBot {
   }
 
   async loadCookiesFromJson(path) {
-    const raw = await fs.readFile(path, 'utf-8');
-    const cookies = JSON.parse(raw);
-    let loaded = 0;
-    for (const cookie of cookies) {
-      const tc = new tough.Cookie({
-        key: cookie.name,
-        value: cookie.value,
-        domain: (cookie.domain || '').replace(/^\./, ''),
-        path: cookie.path || '/',
-        secure: cookie.secure !== false,
-        httpOnly: cookie.httpOnly !== false,
-      });
-      await this.ig.state.cookieJar.setCookie(tc.toString(), `https://${tc.domain}${tc.path}`);
-      loaded++;
+    try {
+      const raw = await fs.readFile(path, 'utf-8');
+      const cookies = JSON.parse(raw);
+      let cookiesLoaded = 0;
+
+      for (const cookie of cookies) {
+        const toughCookie = new tough.Cookie({
+          key: cookie.name,
+          value: cookie.value,
+          domain: (cookie.domain || '').replace(/^\./, ''),
+          path: cookie.path || '/',
+          secure: cookie.secure !== false,
+          httpOnly: cookie.httpOnly !== false,
+        });
+
+        await this.ig.state.cookieJar.setCookie(
+          toughCookie.toString(),
+          `https://${toughCookie.domain}${toughCookie.path}`
+        );
+        cookiesLoaded++;
+      }
+
+      this.log('INFO', `Loaded ${cookiesLoaded}/${cookies.length} cookies from ${path}`);
+    } catch (error) {
+      this.log('ERROR', `Failed to load cookies from ${path}:`, error.message);
+      throw error;
     }
-    this.log('INFO', `Loaded ${loaded}/${cookies.length} cookies`);
+  }
+
+  async postLogin() {
+    // Register handlers and connect to real-time
+    this.registerRealtimeHandlers();
+    await this.ig.realtime.connect({
+      graphQlSubs: [
+        GraphQLSubscriptions.getAppPresenceSubscription(),
+        GraphQLSubscriptions.getZeroProvisionSubscription(this.ig.state.phoneId),
+        GraphQLSubscriptions.getDirectStatusSubscription(),
+        GraphQLSubscriptions.getDirectTypingSubscription(this.ig.state.cookieUserId),
+        GraphQLSubscriptions.getAsyncAdSubscription(this.ig.state.cookieUserId),
+      ],
+      skywalkerSubs: [
+        SkywalkerSubscriptions.directSub(this.ig.state.cookieUserId),
+        SkywalkerSubscriptions.liveSub(this.ig.state.cookieUserId),
+      ],
+      irisData: await this.ig.feed.directInbox().request(),
+      connectOverrides: {},
+      socksOptions: config.proxy ? {
+        type: config.proxy.type || 5,
+        host: config.proxy.host,
+        port: config.proxy.port,
+        userId: config.proxy.username,
+        password: config.proxy.password,
+      } : undefined,
+    });
+
+    // Simulate mobile app in foreground
+    await this.setForegroundState(true, true, 60);
+    this.isRunning = true;
+    this.log('INFO', 'Instagram bot is running and listening for messages');
   }
 
   /**
-   * Post-login setup: register handlers and connect to real-time
+   * Utility to add delay/sleep.
+   * @param {number} ms - Milliseconds to sleep.
    */
-  async postLogin() {
-    try {
-      // Register handlers and connect to real-time
-      this.registerRealtimeHandlers();
-      await this.ig.realtime.connect({
-        graphQlSubs: [
-          GraphQLSubscriptions.getAppPresenceSubscription(),
-          GraphQLSubscriptions.getZeroProvisionSubscription(this.ig.state.phoneId),
-          GraphQLSubscriptions.getDirectStatusSubscription(),
-          GraphQLSubscriptions.getDirectTypingSubscription(this.ig.state.cookieUserId),
-          GraphQLSubscriptions.getAsyncAdSubscription(this.ig.state.cookieUserId),
-        ],
-        skywalkerSubs: [
-          SkywalkerSubscriptions.directSub(this.ig.state.cookieUserId),
-          SkywalkerSubscriptions.liveSub(this.ig.state.cookieUserId),
-        ],
-        irisData: await this.ig.feed.directInbox().request(),
-        connectOverrides: {},
-        socksOptions: config.proxy ? {
-          type: config.proxy.type || 5,
-          host: config.proxy.host,
-          port: config.proxy.port,
-          userId: config.proxy.username,
-          password: config.proxy.password,
-        } : undefined,
-      });
-
-      // Simulate mobile app in foreground
-      await this.setForegroundState(true, true, 60);
-      this.isRunning = true;
-      this.log('INFO', 'Instagram bot is running and listening for messages');
-    } catch (error) {
-      this.log('ERROR', 'Failed to initialize bot:', error.message);
-      throw error;
-    }
+  async sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   /**
