@@ -42,49 +42,108 @@ class InstagramBot {
   async login() {
     try {
       const username = config.instagram?.username;
-      if (!username) {
-        throw new Error('INSTAGRAM_USERNAME is missing');
+      const password = config.instagram?.password;
+      if (!username || !password) {
+        throw new Error('INSTAGRAM_USERNAME or INSTAGRAM_PASSWORD is missing');
       }
 
-      this.ig.state.generateDevice(username); // Simulates mobile device
+      // ---- Load persisted device if exists ----
+      try {
+        const deviceState = JSON.parse(await fs.readFile('./device.json', 'utf-8'));
+        this.ig.state.deviceString = deviceState.deviceString;
+        this.ig.state.deviceId = deviceState.deviceId;
+        this.ig.state.uuid = deviceState.uuid;
+        this.ig.state.phoneId = deviceState.phoneId;
+        this.ig.state.adid = deviceState.adid;
+        this.log('INFO', 'Loaded device state from device.json ✅');
+      } catch {
+        this.ig.state.generateDevice(username);
+        this.log('INFO', 'Generated new device state');
+      }
+
       let loginSuccess = false;
 
-      // Attempt login with session
+      // ---- Try session.json first ----
       try {
         await fs.access('./session.json');
-        this.log('INFO', 'Found session.json, attempting session-based login...');
         const sessionData = JSON.parse(await fs.readFile('./session.json', 'utf-8'));
         await this.ig.state.deserialize(sessionData);
         await this.ig.account.currentUser();
-        this.log('INFO', 'Logged in from session.json');
+        this.log('INFO', 'Logged in from session.json ✅');
         loginSuccess = true;
-      } catch (sessionError) {
-        this.log('WARN', 'Session login failed:', sessionError.message);
+      } catch (e) {
+        this.log('WARN', 'Session login failed:', e.message);
       }
 
-      // Fallback to cookies if session login fails
+      // ---- Try cookies.json ----
       if (!loginSuccess) {
         try {
-          this.log('INFO', 'Attempting login using cookies.json...');
           await this.loadCookiesFromJson('./cookies.json');
           const user = await this.ig.account.currentUser();
-          this.log('INFO', `Logged in using cookies.json as @${user.username}`);
+          this.log('INFO', `Logged in using cookies.json as @${user.username} ✅`);
           const session = await this.ig.state.serialize();
           delete session.constants;
           await fs.writeFile('./session.json', JSON.stringify(session, null, 2));
-          this.log('INFO', 'Session saved to session.json');
           loginSuccess = true;
-        } catch (cookieError) {
-          this.log('ERROR', 'Failed to login with cookies:', cookieError.message);
-          throw new Error(`Cookie login failed: ${cookieError.message}`);
+        } catch (e) {
+          this.log('WARN', 'Cookie login failed:', e.message);
         }
       }
 
+      // ---- Fallback: Fresh login ----
       if (!loginSuccess) {
-        throw new Error('No valid login method succeeded');
+        this.log('INFO', 'Attempting fresh login with username/password...');
+        await this.ig.simulate.preLoginFlow();
+        try {
+          const loggedInUser = await this.ig.account.login(username, password);
+          this.log('INFO', `Fresh login successful as @${loggedInUser.username} ✅`);
+          process.nextTick(async () => await this.ig.simulate.postLoginFlow());
+        } catch (err) {
+          // ---- Challenge handler ----
+          if (err.name === 'IgChallengeError') {
+            this.log('WARN', 'Challenge required, handling automatically...');
+            await this.ig.challenge.auto(true); // auto select method (email/sms)
+
+            if (this.ig.challenge.choice) {
+              this.log('INFO', `Challenge choice available: ${this.ig.challenge.choice}`);
+            }
+
+            // Normally IG will send code (email/sms)
+            const code = await this.promptCode(); // helper function below
+            await this.ig.challenge.sendSecurityCode(code);
+
+            this.log('INFO', 'Challenge solved ✅');
+          } else {
+            throw err;
+          }
+        }
+
+        // Save persistence (session + device + cookies)
+        const session = await this.ig.state.serialize();
+        delete session.constants;
+        await fs.writeFile('./session.json', JSON.stringify(session, null, 2));
+        this.log('INFO', 'New session saved to session.json');
+
+        const deviceDump = {
+          deviceString: this.ig.state.deviceString,
+          deviceId: this.ig.state.deviceId,
+          uuid: this.ig.state.uuid,
+          phoneId: this.ig.state.phoneId,
+          adid: this.ig.state.adid,
+        };
+        await fs.writeFile('./device.json', JSON.stringify(deviceDump, null, 2));
+        this.log('INFO', 'Device state saved to device.json');
+
+        const cookieDump = await this.ig.state.extractCookies();
+        await fs.writeFile('./cookies.json', JSON.stringify(cookieDump, null, 2));
+        this.log('INFO', 'Cookies saved to cookies.json');
+
+        loginSuccess = true;
       }
 
-      // Register handlers and connect to real-time
+      if (!loginSuccess) throw new Error('No valid login method succeeded');
+
+      // ---- Realtime connect ----
       this.registerRealtimeHandlers();
       await this.ig.realtime.connect({
         graphQlSubs: [
@@ -99,17 +158,8 @@ class InstagramBot {
           SkywalkerSubscriptions.liveSub(this.ig.state.cookieUserId),
         ],
         irisData: await this.ig.feed.directInbox().request(),
-        connectOverrides: {},
-        socksOptions: config.proxy ? {
-          type: config.proxy.type || 5,
-          host: config.proxy.host,
-          port: config.proxy.port,
-          userId: config.proxy.username,
-          password: config.proxy.password,
-        } : undefined,
       });
 
-      // Simulate mobile app in foreground
       await this.setForegroundState(true, true, 60);
       this.isRunning = true;
       this.log('INFO', 'Instagram bot is running and listening for messages');
@@ -118,6 +168,18 @@ class InstagramBot {
       throw error;
     }
   }
+
+  // Helper to prompt for challenge code
+  async promptCode() {
+    return new Promise((resolve) => {
+      process.stdout.write('Enter the security code sent by Instagram: ');
+      process.stdin.once('data', (data) => {
+        resolve(data.toString().trim());
+      });
+    });
+  }
+
+
 
   /**
    * Loads cookies from a JSON file.
