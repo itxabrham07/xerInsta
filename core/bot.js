@@ -90,24 +90,25 @@ class InstagramBot {
         }
       }
 
-      // ---- Fallback: Fresh login ----
-      if (!loginSuccess) {
-        this.log('INFO', 'Attempting fresh login with username/password...');
-        await this.ig.simulate.preLoginFlow();
-        try {
-          const loggedInUser = await this.ig.account.login(username, password);
-          this.log('INFO', `Fresh login successful as @${loggedInUser.username} ✅`);
-          process.nextTick(async () => await this.ig.simulate.postLoginFlow());
-        } catch (err) {
-          // ---- Challenge handler ----
-          if (err.name === 'IgChallengeError') {
-            this.log('WARN', 'Challenge required, handling automatically...');
-            await this.ig.challenge.auto(true); // auto select method (email/sms)
-
-            if (this.ig.challenge.choice) {
-              this.log('INFO', `Challenge choice available: ${this.ig.challenge.choice}`);
-            }
-
+// ---- Fallback: Fresh login ----
+if (!loginSuccess) {
+  this.log('INFO', 'Attempting fresh login with username/password...');
+  await this.ig.simulate.preLoginFlow();
+  try {
+    const loggedInUser = await this.ig.account.login(username, password);
+    this.log('INFO', `Fresh login successful as @${loggedInUser.username} ✅`);
+    process.nextTick(async () => await this.ig.simulate.postLoginFlow());
+  } catch (err) {
+    if (err.name === 'IgChallengeError') {
+      this.log('WARN', 'Challenge required, handling automatically...');
+      await this.ig.challenge.auto(true); // auto select method
+      const code = await this.promptCode();
+      await this.ig.challenge.sendSecurityCode(code);
+      this.log('INFO', 'Challenge solved ✅');
+    } else {
+      throw err;
+    }
+  }
             // Normally IG will send code (email/sms)
             const code = await this.promptCode(); // helper function below
             await this.ig.challenge.sendSecurityCode(code);
@@ -118,28 +119,24 @@ class InstagramBot {
           }
         }
 
-        // Save persistence (session + device + cookies)
-        const session = await this.ig.state.serialize();
-        delete session.constants;
-        await fs.writeFile('./session.json', JSON.stringify(session, null, 2));
-        this.log('INFO', 'New session saved to session.json');
+  // ✅ Save only session + device (no cookies dump)
+  const session = await this.ig.state.serialize();
+  delete session.constants;
+  await fs.writeFile('./session.json', JSON.stringify(session, null, 2));
+  this.log('INFO', 'New session saved to session.json');
 
-        const deviceDump = {
-          deviceString: this.ig.state.deviceString,
-          deviceId: this.ig.state.deviceId,
-          uuid: this.ig.state.uuid,
-          phoneId: this.ig.state.phoneId,
-          adid: this.ig.state.adid,
-        };
-        await fs.writeFile('./device.json', JSON.stringify(deviceDump, null, 2));
-        this.log('INFO', 'Device state saved to device.json');
+  const deviceDump = {
+    deviceString: this.ig.state.deviceString,
+    deviceId: this.ig.state.deviceId,
+    uuid: this.ig.state.uuid,
+    phoneId: this.ig.state.phoneId,
+    adid: this.ig.state.adid,
+  };
+  await fs.writeFile('./device.json', JSON.stringify(deviceDump, null, 2));
+  this.log('INFO', 'Device state saved to device.json');
 
-        const cookieDump = await this.ig.state.extractCookies();
-        await fs.writeFile('./cookies.json', JSON.stringify(cookieDump, null, 2));
-        this.log('INFO', 'Cookies saved to cookies.json');
-
-        loginSuccess = true;
-      }
+  loginSuccess = true;
+}
 
       if (!loginSuccess) throw new Error('No valid login method succeeded');
 
