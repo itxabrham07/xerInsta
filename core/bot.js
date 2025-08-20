@@ -1,4 +1,4 @@
-import { IgApiClient } from 'instagram-private-api';
+import { IgApiClient, IgLoginTwoFactorRequiredError, IgCheckpointError } from 'instagram-private-api';
 import { withRealtime } from 'instagram_mqtt';
 import { GraphQLSubscriptions, SkywalkerSubscriptions } from 'instagram_mqtt';
 import { promises as fs } from 'fs';
@@ -8,221 +8,343 @@ import { MessageHandler } from './message-handler.js';
 import { config } from '../config.js';
 
 /**
- * InstagramBot class to manage Instagram interactions via the private API and MQTT.
+ * InstagramBot — robust version
+ * - Persistent device fingerprint (device.json)
+ * - Login order: session.json -> cookies.json -> fresh username/password
+ * - Optional 2FA support (reads config.instagram.twoFactorCode or TOTP via config.instagram.totpSecret if otplib is available)
+ * - Realtime reconnect with backoff
+ * - Human-like jitter for heartbeats & foreground state
  */
 class InstagramBot {
-  /**
-   * Initializes the InstagramBot with necessary properties.
-   */
-  constructor() {
+  constructor(options = {}) {
     this.ig = withRealtime(new IgApiClient());
     this.messageHandlers = [];
     this.isRunning = false;
-    this.lastMessageCheck = new Date(Date.now() - 60000);
     this.processedMessageIds = new Set();
     this.maxProcessedMessageIds = 1000;
-    this.userCache = new Map(); // Cache for user info
+    this.userCache = new Map();
+
+    this.paths = {
+      device: options.devicePath || './device.json',
+      session: options.sessionPath || './session.json',
+      cookies: options.cookiesPath || './cookies.json',
+    };
+
+    this.heartbeatTimer = null;
+    this.foregroundTimer = null;
+    this.reconnectAttempt = 0;
   }
 
-  /**
-   * Logs messages with timestamp and log level.
-   * @param {string} level - Log level (INFO, WARN, ERROR, DEBUG, TRACE).
-   * @param {string} message - The message to log.
-   * @param {...any} args - Additional arguments to log.
-   */
   log(level, message, ...args) {
     const timestamp = new Date().toISOString();
     console.log(`[${timestamp}] [${level}] ${message}`, ...args);
   }
 
-  /**
-   * Logs in to Instagram using session or cookies.
-   * @throws {Error} If login fails due to missing credentials or invalid session/cookies.
-   */
-  async login() {
+  // ---------- Device Persistence ----------
+  async initDevice(username) {
     try {
-      const username = config.instagram?.username;
-      if (!username) {
-        throw new Error('INSTAGRAM_USERNAME is missing');
+      const raw = await fs.readFile(this.paths.device, 'utf-8');
+      const dev = JSON.parse(raw);
+      if (dev.username === username && dev.deviceString) {
+        this.ig.state.deviceString = dev.deviceString;
+        this.ig.state.deviceId = dev.deviceId;
+        this.ig.state.uuid = dev.uuid;
+        this.ig.state.phoneId = dev.phoneId;
+        this.ig.state.adid = dev.adid;
+        this.log('INFO', `Loaded persistent device for @${username}`);
+        return;
+      }
+      this.log('WARN', 'Device file present but mismatched username or malformed; regenerating.');
+    } catch {
+      this.log('INFO', 'No device.json found; generating new device.');
+    }
+
+    this.ig.state.generateDevice(username);
+    await this.saveDevice(username);
+  }
+
+  async saveDevice(username) {
+    const dev = {
+      username,
+      deviceString: this.ig.state.deviceString,
+      deviceId: this.ig.state.deviceId,
+      uuid: this.ig.state.uuid,
+      phoneId: this.ig.state.phoneId,
+      adid: this.ig.state.adid,
+    };
+    await fs.writeFile(this.paths.device, JSON.stringify(dev, null, 2));
+    this.log('INFO', `Saved device fingerprint for @${username}`);
+  }
+
+  // ---------- Login Flow ----------
+  async login() {
+    const username = config.instagram?.username;
+    const password = config.instagram?.password; // optional for fresh login
+    const forceFresh = Boolean(config.instagram?.forceFreshLogin);
+
+    if (!username) throw new Error('INSTAGRAM_USERNAME is missing');
+
+    await this.initDevice(username);
+
+    if (!forceFresh) {
+      // 1) Try session.json
+      if (await this.trySessionLogin()) {
+        await this.postLogin();
+        return;
       }
 
-      this.ig.state.generateDevice(username); // Simulates mobile device
-      let loginSuccess = false;
+      // 2) Try cookies.json
+      if (await this.tryCookieLogin()) {
+        await this.postLogin();
+        return;
+      }
+    } else {
+      this.log('INFO', 'forceFreshLogin=true, skipping session/cookies.');
+    }
 
-      // Attempt login with session
-      try {
-        await fs.access('./session.json');
-        this.log('INFO', 'Found session.json, attempting session-based login...');
-        const sessionData = JSON.parse(await fs.readFile('./session.json', 'utf-8'));
-        await this.ig.state.deserialize(sessionData);
-        await this.ig.account.currentUser();
-        this.log('INFO', 'Logged in from session.json');
-        loginSuccess = true;
-      } catch (sessionError) {
-        this.log('WARN', 'Session login failed:', sessionError.message);
+    // 3) Fresh login
+    if (!password) throw new Error('No valid login method; set instagram.password for fresh login.');
+    await this.freshLogin(username, password);
+    await this.postLogin();
+  }
+
+  async trySessionLogin() {
+    try {
+      const raw = await fs.readFile(this.paths.session, 'utf-8');
+      const sessionData = JSON.parse(raw);
+      await this.ig.state.deserialize(sessionData);
+      await this.ig.account.currentUser();
+      this.log('INFO', 'Logged in using session.json');
+      return true;
+    } catch (err) {
+      this.log('WARN', `Session login failed: ${err?.message || err}`);
+      return false;
+    }
+  }
+
+  async tryCookieLogin() {
+    try {
+      await this.loadCookiesFromJson(this.paths.cookies);
+      await this.ig.account.currentUser();
+      this.log('INFO', 'Logged in using cookies.json');
+      await this.saveSession();
+      return true;
+    } catch (err) {
+      this.log('WARN', `Cookie login failed: ${err?.message || err}`);
+      return false;
+    }
+  }
+
+  async freshLogin(username, password) {
+    try {
+      this.log('INFO', 'Attempting fresh login...');
+      await this.ig.account.login(username, password);
+      this.log('INFO', `Fresh login successful as @${username}`);
+      await this.saveSession();
+    } catch (err) {
+      // 2FA flow
+      if (err instanceof IgLoginTwoFactorRequiredError || err?.name === 'IgLoginTwoFactorRequiredError') {
+        await this.handleTwoFactorLogin(err, username, password);
+        return;
       }
 
-      // Fallback to cookies if session login fails
-      if (!loginSuccess) {
+      // Checkpoint flow (review/verify)
+      if (err instanceof IgCheckpointError || err?.name === 'IgCheckpointError') {
+        this.log('WARN', 'Checkpoint required. Attempting auto-resolution...');
         try {
-          this.log('INFO', 'Attempting login using cookies.json...');
-          await this.loadCookiesFromJson('./cookies.json');
-          const user = await this.ig.account.currentUser();
-          this.log('INFO', `Logged in using cookies.json as @${user.username}`);
-          const session = await this.ig.state.serialize();
-          delete session.constants;
-          await fs.writeFile('./session.json', JSON.stringify(session, null, 2));
-          this.log('INFO', 'Session saved to session.json');
-          loginSuccess = true;
-        } catch (cookieError) {
-          this.log('ERROR', 'Failed to login with cookies:', cookieError.message);
-          throw new Error(`Cookie login failed: ${cookieError.message}`);
+          await this.ig.challenge.auto(true);
+          await this.ig.account.currentUser();
+          this.log('INFO', 'Checkpoint auto-resolved.');
+          await this.saveSession();
+          return;
+        } catch (e2) {
+          this.log('ERROR', `Checkpoint auto-resolution failed: ${e2?.message || e2}`);
         }
       }
 
-      if (!loginSuccess) {
-        throw new Error('No valid login method succeeded');
-      }
+      throw err; // bubble up if not handled
+    }
+  }
 
-      // Register handlers and connect to real-time
-      this.registerRealtimeHandlers();
-      await this.ig.realtime.connect({
-        graphQlSubs: [
-          GraphQLSubscriptions.getAppPresenceSubscription(),
-          GraphQLSubscriptions.getZeroProvisionSubscription(this.ig.state.phoneId),
-          GraphQLSubscriptions.getDirectStatusSubscription(),
-          GraphQLSubscriptions.getDirectTypingSubscription(this.ig.state.cookieUserId),
-          GraphQLSubscriptions.getAsyncAdSubscription(this.ig.state.cookieUserId),
-        ],
-        skywalkerSubs: [
-          SkywalkerSubscriptions.directSub(this.ig.state.cookieUserId),
-          SkywalkerSubscriptions.liveSub(this.ig.state.cookieUserId),
-        ],
-        irisData: await this.ig.feed.directInbox().request(),
-        connectOverrides: {},
-        socksOptions: config.proxy ? {
+  async handleTwoFactorLogin(error, username, password) {
+    const { two_factor_info: info } = error;
+    const identifier = info?.two_factor_identifier;
+    const totp = info?.totp_two_factor_on; // if true, authenticator app is allowed
+
+    if (!identifier) throw new Error('2FA required but no identifier provided by Instagram.');
+
+    let code = (config.instagram?.twoFactorCode || '').toString().trim();
+
+    // If no static code, try TOTP via otplib if totp is enabled and secret is provided
+    if (!code && totp && config.instagram?.totpSecret) {
+      try {
+        const { totp: totpGen } = await import('otplib');
+        code = totpGen.generate(config.instagram.totpSecret);
+        this.log('INFO', 'Generated TOTP code via otplib.');
+      } catch {
+        this.log('WARN', 'otplib not installed; cannot auto-generate TOTP. Provide instagram.twoFactorCode or install otplib.');
+      }
+    }
+
+    if (!code) throw new Error('2FA code required. Set config.instagram.twoFactorCode or instagram.totpSecret (+ otplib).');
+
+    const method = totp ? '0' : String(info?.sms_two_factor_on ? 1 : 0);
+
+    await this.ig.account.twoFactorLogin({
+      username,
+      password,
+      twoFactorIdentifier: identifier,
+      verificationCode: code,
+      verificationMethod: method, // '0' = TOTP/app, '1' = SMS
+      trustThisDevice: true,
+    });
+
+    this.log('INFO', '2FA login successful.');
+    await this.saveSession();
+  }
+
+  async saveSession() {
+    const session = await this.ig.state.serialize();
+    delete session.constants;
+    await fs.writeFile(this.paths.session, JSON.stringify(session, null, 2));
+    this.log('INFO', 'Session saved to session.json');
+  }
+
+  async loadCookiesFromJson(path) {
+    const raw = await fs.readFile(path, 'utf-8');
+    const cookies = JSON.parse(raw);
+    let loaded = 0;
+    for (const cookie of cookies) {
+      const tc = new tough.Cookie({
+        key: cookie.name,
+        value: cookie.value,
+        domain: (cookie.domain || '').replace(/^\./, ''),
+        path: cookie.path || '/',
+        secure: cookie.secure !== false,
+        httpOnly: cookie.httpOnly !== false,
+      });
+      await this.ig.state.cookieJar.setCookie(tc.toString(), `https://${tc.domain}${tc.path}`);
+      loaded++;
+    }
+    this.log('INFO', `Loaded ${loaded}/${cookies.length} cookies`);
+  }
+
+  // ---------- Realtime ----------
+  async postLogin() {
+    this.registerRealtimeHandlers();
+    await this.connectRealtime();
+
+    // Initial foreground presence
+    await this.setForegroundState(true, true, 60 + this.rand(-10, 10));
+    this.isRunning = true;
+
+    // Start jittered tasks
+    this.scheduleHeartbeat();
+    this.scheduleForegroundCycles();
+  }
+
+  async connectRealtime() {
+    const socksOptions = config.proxy
+      ? {
           type: config.proxy.type || 5,
           host: config.proxy.host,
           port: config.proxy.port,
           userId: config.proxy.username,
           password: config.proxy.password,
-        } : undefined,
-      });
+        }
+      : undefined;
 
-      // Simulate mobile app in foreground
-      await this.setForegroundState(true, true, 60);
-      this.isRunning = true;
-      this.log('INFO', 'Instagram bot is running and listening for messages');
-    } catch (error) {
-      this.log('ERROR', 'Failed to initialize bot:', error.message);
-      throw error;
-    }
+    await this.ig.realtime.connect({
+      graphQlSubs: [
+        GraphQLSubscriptions.getAppPresenceSubscription(),
+        GraphQLSubscriptions.getZeroProvisionSubscription(this.ig.state.phoneId),
+        GraphQLSubscriptions.getDirectStatusSubscription(),
+        GraphQLSubscriptions.getDirectTypingSubscription(this.ig.state.cookieUserId),
+        GraphQLSubscriptions.getAsyncAdSubscription(this.ig.state.cookieUserId),
+      ],
+      skywalkerSubs: [
+        SkywalkerSubscriptions.directSub(this.ig.state.cookieUserId),
+        SkywalkerSubscriptions.liveSub(this.ig.state.cookieUserId),
+      ],
+      irisData: await this.ig.feed.directInbox().request(),
+      connectOverrides: {},
+      socksOptions,
+    });
   }
 
-  /**
-   * Loads cookies from a JSON file.
-   * @param {string} path - Path to the cookies file.
-   * @throws {Error} If loading cookies fails.
-   */
-  async loadCookiesFromJson(path = './cookies.json') {
-    try {
-      const raw = await fs.readFile(path, 'utf-8');
-      const cookies = JSON.parse(raw);
-      let cookiesLoaded = 0;
-
-      for (const cookie of cookies) {
-        const toughCookie = new tough.Cookie({
-          key: cookie.name,
-          value: cookie.value,
-          domain: cookie.domain.replace(/^\./, ''),
-          path: cookie.path || '/',
-          secure: cookie.secure !== false,
-          httpOnly: cookie.httpOnly !== false,
-        });
-
-        await this.ig.state.cookieJar.setCookie(
-          toughCookie.toString(),
-          `https://${toughCookie.domain}${toughCookie.path}`
-        );
-        cookiesLoaded++;
-      }
-
-      this.log('INFO', `Loaded ${cookiesLoaded}/${cookies.length} cookies`);
-    } catch (error) {
-      this.log('ERROR', `Failed to load cookies from ${path}:`, error.message);
-      throw error;
-    }
-  }
-
-  /**
-   * Registers real-time event handlers for Instagram events.
-   */
   registerRealtimeHandlers() {
-    this.log('INFO', 'Registering real-time event handlers...');
+    this.log('INFO', 'Registering realtime handlers...');
 
-    // Handle direct messages
     this.ig.realtime.on('message', async (data) => {
-      if (!data.message) {
-        this.log('WARN', 'No message payload in event data');
-        return;
-      }
-      if (!this.isNewMessageById(data.message.item_id)) {
-        this.log('DEBUG', `Message ${data.message.item_id} filtered as duplicate`);
-        return;
-      }
-      await this.handleMessage(data.message, data);
-    });
-
-    // Handle other direct events
-    this.ig.realtime.on('direct', async (data) => {
-      if (data.message && this.isNewMessageById(data.message.item_id)) {
+      try {
+        if (!data?.message) return;
+        const id = data.message.item_id;
+        if (!this.isNewMessageById(id)) return;
         await this.handleMessage(data.message, data);
-      } else {
-        this.log('DEBUG', 'Received non-message direct event:', JSON.stringify(data, null, 2));
+      } catch (e) {
+        this.log('ERROR', `Realtime message handler error: ${e?.message || e}`);
       }
     });
 
-    // General receive event for debugging
+    this.ig.realtime.on('direct', async (data) => {
+      try {
+        if (data?.message && this.isNewMessageById(data.message.item_id)) {
+          await this.handleMessage(data.message, data);
+        }
+      } catch (e) {
+        this.log('ERROR', `Realtime direct handler error: ${e?.message || e}`);
+      }
+    });
+
     this.ig.realtime.on('receive', (topic, messages) => {
-      const topicStr = String(topic || '');
-      if (topicStr.includes('direct') || topicStr.includes('message') || topicStr.includes('iris')) {
-        this.log('DEBUG', `Received on topic: ${topicStr}`, JSON.stringify(messages, null, 2));
+      const t = String(topic || '');
+      if (t.includes('direct') || t.includes('message') || t.includes('iris')) {
+        this.log('DEBUG', `Received on topic: ${t}`, JSON.stringify(messages, null, 2));
       }
-    });
-
-    // Connection lifecycle events
-    this.ig.realtime.on('error', (err) => {
-      this.log('ERROR', 'Realtime connection error:', err.message);
-    });
-
-    this.ig.realtime.on('close', () => {
-      this.log('WARN', 'Realtime connection closed');
-      this.isRunning = false;
     });
 
     this.ig.realtime.on('connect', () => {
-      this.log('INFO', 'Realtime connection established');
+      this.log('INFO', 'Realtime connected');
       this.isRunning = true;
+      this.reconnectAttempt = 0; // reset backoff
+    });
+
+    this.ig.realtime.on('close', async () => {
+      this.log('WARN', 'Realtime connection closed');
+      this.isRunning = false;
+      await this.scheduleReconnect();
+    });
+
+    this.ig.realtime.on('error', async (err) => {
+      this.log('ERROR', `Realtime error: ${err?.message || err}`);
+      await this.scheduleReconnect();
     });
 
     this.ig.realtime.on('reconnect', () => {
-      this.log('INFO', 'Realtime client is reconnecting');
+      this.log('INFO', 'Realtime reconnect event emitted');
     });
   }
 
-  /**
-   * Checks if a message is new based on its ID.
-   * @param {string} messageId - The message ID.
-   * @returns {boolean} True if the message is new.
-   */
+  async scheduleReconnect() {
+    // Exponential backoff with jitter: base 2s up to ~60s
+    const base = Math.min(60000, 2000 * Math.pow(2, this.reconnectAttempt));
+    const delay = this.jitter(base, 0.2);
+    this.reconnectAttempt++;
+    this.log('INFO', `Scheduling reconnect in ${Math.round(delay / 1000)}s (attempt ${this.reconnectAttempt})`);
+    await this.sleep(delay);
+    try {
+      await this.connectRealtime();
+    } catch (e) {
+      this.log('ERROR', `Reconnect failed: ${e?.message || e}`);
+      // try again later
+      await this.scheduleReconnect();
+    }
+  }
+
+  // ---------- Messaging ----------
   isNewMessageById(messageId) {
-    if (!messageId) {
-      this.log('WARN', 'Missing message ID');
-      return true;
-    }
-    if (this.processedMessageIds.has(messageId)) {
-      return false;
-    }
+    if (!messageId) return true;
+    if (this.processedMessageIds.has(messageId)) return false;
     this.processedMessageIds.add(messageId);
     if (this.processedMessageIds.size > this.maxProcessedMessageIds) {
       const first = this.processedMessageIds.values().next().value;
@@ -231,16 +353,9 @@ class InstagramBot {
     return true;
   }
 
-  /**
-   * Fetches username for a user ID, using cache or API.
-   * @param {string} userId - The Instagram user ID.
-   * @returns {string} The username or fallback ID.
-   */
   async getUsername(userId) {
     if (!userId) return `user_${userId || 'unknown'}`;
-    if (this.userCache.has(userId)) {
-      return this.userCache.get(userId);
-    }
+    if (this.userCache.has(userId)) return this.userCache.get(userId);
     try {
       const userInfo = await this.ig.user.info(userId);
       const username = userInfo.username || `user_${userId}`;
@@ -248,16 +363,11 @@ class InstagramBot {
       this.log('DEBUG', `Fetched username ${username} for user ID ${userId}`);
       return username;
     } catch (error) {
-      this.log('ERROR', `Failed to fetch username for user ID ${userId}:`, error.message);
+      this.log('ERROR', `Failed to fetch username for user ID ${userId}: ${error?.message || error}`);
       return `user_${userId}`;
     }
   }
 
-  /**
-   * Handles incoming messages.
-   * @param {object} message - The message object.
-   * @param {object} eventData - Additional event data.
-   */
   async handleMessage(message, eventData) {
     try {
       if (!message || !message.user_id || !message.item_id) {
@@ -266,13 +376,9 @@ class InstagramBot {
       }
 
       let senderUsername = `user_${message.user_id}`;
-      if (eventData.thread?.users) {
-        const sender = eventData.thread.users.find(u => u.pk?.toString() === message.user_id?.toString());
-        if (sender?.username) {
-          senderUsername = sender.username;
-        } else {
-          senderUsername = await this.getUsername(message.user_id);
-        }
+      if (eventData?.thread?.users) {
+        const sender = eventData.thread.users.find((u) => u.pk?.toString() === message.user_id?.toString());
+        senderUsername = sender?.username || (await this.getUsername(message.user_id));
       } else {
         senderUsername = await this.getUsername(message.user_id);
       }
@@ -283,8 +389,8 @@ class InstagramBot {
         senderId: message.user_id,
         senderUsername,
         timestamp: new Date(parseInt(message.timestamp, 10) / 1000),
-        threadId: eventData.thread?.thread_id || message.thread_id || 'unknown_thread',
-        threadTitle: eventData.thread?.thread_title || message.thread_title || 'Direct Message',
+        threadId: eventData?.thread?.thread_id || message.thread_id || 'unknown_thread',
+        threadTitle: eventData?.thread?.thread_title || message.thread_title || 'Direct Message',
         type: message.item_type || 'unknown_type',
         raw: message,
       };
@@ -295,14 +401,10 @@ class InstagramBot {
         await handler(processedMessage);
       }
     } catch (error) {
-      this.log('ERROR', 'Error handling message:', error.message);
+      this.log('ERROR', `Error handling message: ${error?.message || error}`);
     }
   }
 
-  /**
-   * Registers a message handler.
-   * @param {Function} handler - The handler function.
-   */
   onMessage(handler) {
     if (typeof handler === 'function') {
       this.messageHandlers.push(handler);
@@ -312,34 +414,15 @@ class InstagramBot {
     }
   }
 
-  /**
-   * Sends a text message to a thread.
-   * @param {string} threadId - The thread ID.
-   * @param {string} text - The message text.
-   * @returns {boolean} True if sent successfully.
-   */
   async sendMessage(threadId, text) {
-    if (!threadId || !text) {
-      this.log('WARN', 'Missing threadId or text');
-      throw new Error('Thread ID and text are required');
-    }
-    try {
-      await this.ig.entity.directThread(threadId).broadcastText(text);
-      this.log('INFO', `Text message sent to thread ${threadId}: "${text}"`);
-      return true;
-    } catch (error) {
-      this.log('ERROR', `Error sending text message to thread ${threadId}:`, error.message);
-      throw error;
-    }
+    if (!threadId || !text) throw new Error('Thread ID and text are required');
+    await this.sleep(this.rand(300, 1500)); // small human-like delay
+    await this.ig.entity.directThread(threadId).broadcastText(text);
+    this.log('INFO', `Text message sent to thread ${threadId}: "${text}"`);
+    return true;
   }
 
-  /**
-   * Sets the app/device foreground state to simulate mobile activity.
-   * @param {boolean} inApp - App foreground state.
-   * @param {boolean} inDevice - Device foreground state.
-   * @param {number} timeoutSeconds - Timeout in seconds.
-   * @returns {boolean} True if state is set successfully.
-   */
+  // ---------- Foreground / Presence Simulation ----------
   async setForegroundState(inApp = true, inDevice = true, timeoutSeconds = 60) {
     const timeout = inApp ? Math.max(10, timeoutSeconds) : 900;
     try {
@@ -351,32 +434,39 @@ class InstagramBot {
       this.log('INFO', `Foreground state set: App=${inApp}, Device=${inDevice}, Timeout=${timeout}s`);
       return true;
     } catch (error) {
-      this.log('ERROR', 'Failed to set foreground state:', error.message);
+      this.log('ERROR', `Failed to set foreground state: ${error?.message || error}`);
       return false;
     }
   }
 
-  /**
-   * Simulates toggling device state to mimic mobile app behavior.
-   */
-  async simulateDeviceToggle() {
-    this.log('INFO', 'Starting device simulation: Turning OFF...');
-    const offSuccess = await this.setForegroundState(false, false, 900);
-    if (!offSuccess) {
-      this.log('WARN', 'Simulation step 1 (device off) failed');
-    }
+  scheduleForegroundCycles() {
+    // Simulate user sometimes backgrounding the app
+    const runCycle = async () => {
+      // App goes background for 5–20 min
+      await this.setForegroundState(false, false, 900);
+      await this.sleep(this.rand(5 * 60_000, 20 * 60_000));
+      // Back to foreground for 1–10 min
+      await this.setForegroundState(true, true, 60 + this.rand(-10, 10));
+      await this.sleep(this.rand(1 * 60_000, 10 * 60_000));
+      this.foregroundTimer = setTimeout(runCycle, this.rand(15 * 60_000, 60 * 60_000));
+    };
 
-    setTimeout(async () => {
-      this.log('INFO', 'Simulation: Turning device ON...');
-      const onSuccess = await this.setForegroundState(true, true, 60);
-      this.log(onSuccess ? 'INFO' : 'WARN', 
-        onSuccess ? 'Device simulation cycle completed' : 'Simulation step 2 (device on) failed');
-    }, 5000);
+    // start after a short random delay
+    this.foregroundTimer = setTimeout(runCycle, this.rand(60_000, 5 * 60_000));
   }
 
-  /**
-   * Gracefully disconnects the bot.
-   */
+  // ---------- Heartbeat ----------
+  scheduleHeartbeat() {
+    const run = () => {
+      this.log('INFO', `[Heartbeat] Running: ${this.isRunning}`);
+      const next = this.jitter(5 * 60_000, 0.4); // ~5min ±40%
+      this.heartbeatTimer = setTimeout(run, next);
+    };
+    const first = this.jitter(2 * 60_000, 0.5); // first after ~2min ±50%
+    this.heartbeatTimer = setTimeout(run, first);
+  }
+
+  // ---------- Graceful Disconnect ----------
   async disconnect() {
     this.log('INFO', 'Initiating graceful disconnect...');
     this.isRunning = false;
@@ -384,7 +474,7 @@ class InstagramBot {
     try {
       await this.setForegroundState(false, false, 900);
     } catch (error) {
-      this.log('WARN', 'Error setting background state:', error.message);
+      this.log('WARN', `Error setting background state: ${error?.message || error}`);
     }
 
     try {
@@ -393,8 +483,25 @@ class InstagramBot {
         this.log('INFO', 'Disconnected from Instagram realtime');
       }
     } catch (error) {
-      this.log('WARN', 'Error during disconnect:', error.message);
+      this.log('WARN', `Error during disconnect: ${error?.message || error}`);
     }
+
+    if (this.heartbeatTimer) clearTimeout(this.heartbeatTimer);
+    if (this.foregroundTimer) clearTimeout(this.foregroundTimer);
+  }
+
+  // ---------- Utils ----------
+  rand(min, max) {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+  }
+
+  jitter(baseMs, fraction = 0.2) {
+    const delta = baseMs * fraction;
+    return Math.floor(baseMs - delta + Math.random() * (2 * delta));
+  }
+
+  sleep(ms) {
+    return new Promise((res) => setTimeout(res, ms));
   }
 }
 
@@ -415,10 +522,6 @@ async function main() {
 
     console.log('Bot is running with full module support. Type .help for commands.');
 
-    setInterval(() => {
-      console.log(`[${new Date().toISOString()}] Bot heartbeat - Running: ${bot.isRunning}`);
-    }, 300000);
-
     const shutdownHandler = async () => {
       console.log('\n[SIGINT/SIGTERM] Shutting down gracefully...');
       if (bot) await bot.disconnect();
@@ -429,7 +532,7 @@ async function main() {
     process.on('SIGINT', shutdownHandler);
     process.on('SIGTERM', shutdownHandler);
   } catch (error) {
-    console.error('Bot failed to start:', error.message);
+    console.error('Bot failed to start:', error?.message || error);
     if (bot) await bot.disconnect();
     process.exit(1);
   }
@@ -437,7 +540,7 @@ async function main() {
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   main().catch((error) => {
-    console.error('Unhandled error in main:', error.message);
+    console.error('Unhandled error in main:', error?.message || error);
     process.exit(1);
   });
 }
