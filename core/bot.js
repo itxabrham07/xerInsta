@@ -138,6 +138,9 @@ class InstagramBot {
       if (loginResponse) {
         this.log('INFO', 'Fresh login successful!');
         
+        // Wait a bit after fresh login to avoid rate limits
+        await this.delay(2000);
+        
         // Save session
         const session = await this.ig.state.serialize();
         delete session.constants;
@@ -183,6 +186,35 @@ class InstagramBot {
     }
   }
 
+  /**
+   * Attempts to get inbox data with retry logic
+   * @param {number} maxRetries - Maximum number of retries
+   * @param {number} delay - Delay between retries in ms
+   * @returns {Promise<object>} Inbox data
+   */
+  async getInboxWithRetry(maxRetries = 3, delay = 3000) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        this.log('INFO', `Fetching inbox data (attempt ${attempt}/${maxRetries})...`);
+        const inboxData = await this.ig.feed.directInbox().request();
+        this.log('INFO', 'Successfully fetched inbox data');
+        return inboxData;
+      } catch (error) {
+        this.log('WARN', `Inbox fetch attempt ${attempt} failed:`, error.message);
+        
+        if (attempt === maxRetries) {
+          this.log('ERROR', 'All inbox fetch attempts failed');
+          throw error;
+        }
+        
+        this.log('INFO', `Waiting ${delay}ms before retry...`);
+        await this.delay(delay);
+        
+        // Increase delay for next attempt
+        delay *= 1.5;
+      }
+    }
+  }
   // ---------- Login Flow ----------
   async login() {
     const username = config.instagram?.username;
@@ -257,6 +289,20 @@ class InstagramBot {
 
     // Register handlers and connect to real-time
     this.registerRealtimeHandlers();
+    
+    // Get inbox data with retry logic
+    let irisData;
+    try {
+      irisData = await this.getInboxWithRetry(3, 2000);
+    } catch (inboxError) {
+      this.log('WARN', 'Failed to fetch inbox data, continuing without realtime connection');
+      // Continue without realtime if inbox fails
+      await this.setForegroundState(true, true, 60);
+      this.isRunning = true;
+      this.log('INFO', 'Instagram bot is running (without realtime connection)');
+      return;
+    }
+    
     await this.ig.realtime.connect({
       graphQlSubs: [
         GraphQLSubscriptions.getAppPresenceSubscription(),
@@ -269,7 +315,7 @@ class InstagramBot {
         SkywalkerSubscriptions.directSub(this.ig.state.cookieUserId),
         SkywalkerSubscriptions.liveSub(this.ig.state.cookieUserId),
       ],
-      irisData: await this.ig.feed.directInbox().request(),
+      irisData: irisData,
       connectOverrides: {},
       socksOptions: config.proxy ? {
         type: config.proxy.type || 5,
@@ -577,7 +623,9 @@ class InstagramBot {
     this.isRunning = false;
 
     try {
-      await this.setForegroundState(false, false, 900);
+      if (this.ig.realtime && this.ig.realtime.direct) {
+        await this.setForegroundState(false, false, 900);
+      }
     } catch (error) {
       this.log('WARN', 'Error setting background state:', error.message);
     }
