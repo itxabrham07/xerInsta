@@ -338,8 +338,6 @@ class TelegramBridge {
                 } else {
                     throw new Error('Instagram send failed');
                 }
-            } else if (msg.voice) {
-                await this.handleTelegramVoice(msg, instagramThreadId);
             } else {
                 logger.debug(`🚫 Ignoring non-text/non-voice message from Telegram`);
                 await this.setReaction(msg.chat.id, msg.message_id, '🚫');
