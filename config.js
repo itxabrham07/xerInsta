@@ -1,7 +1,7 @@
 export const config = {
   instagram: {
-    username: 'ixnicx02', // Your Instagram username
-    password: 'your_instagram_password', // Your Instagram password
+    username: 'cikoyiy1487', // Your Instagram username
+    password: '12312320Pk..', // Your Instagram password
     useMongoSession: true // Set to false to use file-based sessions
   },
   messageRequests: {
