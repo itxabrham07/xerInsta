@@ -84,7 +84,44 @@ if (!loginSuccess) {
   try {
     const loggedInUser = await this.ig.account.login(username, password);
     this.log('INFO', `Fresh login successful as @${loggedInUser.username} ✅`);
-    process.nextTick(async () => await this.ig.simulate.postLoginFlow());
+    process.nextTick(async () => await this.ig.simulate.postLoginFlow());setTimeout(async () => {
+  this.log('INFO', 'Starting safe post-login setup...');
+
+  try {
+    // 1. Load reels tray (safe and useful)
+    await this.ig.feed.reelsTray().request();
+    this.log('DEBUG', '✅ Reels tray loaded');
+  } catch (error) {
+    this.log('DEBUG', 'Skipped reels tray:', error.message);
+  }
+
+  try {
+    // 2. Register push notifications (important for some MQTT features)
+    await this.ig.push.register();
+    this.log('DEBUG', '✅ Push registration complete');
+  } catch (error) {
+    this.log('DEBUG', 'Push registration failed (non-critical):', error.message);
+  }
+
+  try {
+    // 3. Mark app as active (simulates "seen" status)
+    await this.ig.directThread.broadcastVoiceMedia({ action: 'started' });
+    this.log('DEBUG', '✅ Voice broadcast init sent (presence hint)');
+  } catch (error) {
+    this.log('DEBUG', 'Voice broadcast init failed (non-critical):', error.message);
+  }
+
+  // Optional: warm up direct inbox
+  try {
+    await this.ig.feed.directInbox().items();
+    this.log('DEBUG', '✅ Direct inbox warmed up');
+  } catch (error) {
+    this.log('DEBUG', 'Inbox warm-up failed:', error.message);
+  }
+
+  this.log('INFO', 'Safe post-login setup completed');
+}, 1000);
+
   } catch (err) {
     if (err.name === 'IgChallengeError') {
       this.log('WARN', 'Challenge required, handling automatically...');
