@@ -1,4 +1,4 @@
-import { IgApiClient } from 'instagram-private-api';
+import { IgApiClient, IgLoginTwoFactorRequiredError, IgCheckpointError } from 'instagram-private-api';
 import { withRealtime } from 'instagram_mqtt';
 import { GraphQLSubscriptions, SkywalkerSubscriptions } from 'instagram_mqtt';
 import { promises as fs } from 'fs';
@@ -22,12 +22,21 @@ class InstagramBot {
     this.processedMessageIds = new Set();
     this.maxProcessedMessageIds = 1000;
     this.userCache = new Map(); // Cache for user info
+    
+    // File paths for persistence
+    this.paths = {
+      session: './session.json',
+      cookies: './cookies.json',
+      device: './device.json'
+    };
+  }
 
-this.paths = {
-device: options.devicePath || './device.json',
-session: options.sessionPath || './session.json',
-cookies: options.cookiesPath || './cookies.json',
-};
+  /**
+   * Sleep utility function
+   * @param {number} ms - Milliseconds to sleep
+   */
+  sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   /**
@@ -42,33 +51,165 @@ cookies: options.cookiesPath || './cookies.json',
   }
 
   // ---------- Device Persistence ----------
-async saveSession() {
-const session = await this.ig.state.serialize();
-delete session.constants;
-await fs.writeFile(this.paths.session, JSON.stringify(session, null, 2));
-this.log('INFO', 'Session saved to session.json');
-}
+  async initDevice(username) {
+    try {
+      const raw = await fs.readFile(this.paths.device, 'utf-8');
+      const dev = JSON.parse(raw);
+      if (dev.username === username && dev.deviceString) {
+        this.ig.state.deviceString = dev.deviceString;
+        this.ig.state.deviceId = dev.deviceId;
+        this.ig.state.uuid = dev.uuid;
+        this.ig.state.phoneId = dev.phoneId;
+        this.ig.state.adid = dev.adid;
+        this.log('INFO', `Loaded persistent device for @${username}`);
+        return;
+      }
+      this.log('WARN', 'Device file present but mismatched username or malformed; regenerating.');
+    } catch {
+      this.log('INFO', 'No device.json found; generating new device.');
+    }
 
+    this.ig.state.generateDevice(username);
+    await this.saveDevice(username);
+  }
 
-async loadCookiesFromJson(path) {
-const raw = await fs.readFile(path, 'utf-8');
-const cookies = JSON.parse(raw);
-let loaded = 0;
-for (const cookie of cookies) {
-const tc = new tough.Cookie({
-key: cookie.name,
-value: cookie.value,
-domain: (cookie.domain || '').replace(/^\./, ''),
-path: cookie.path || '/',
-secure: cookie.secure !== false,
-httpOnly: cookie.httpOnly !== false,
-});
-await this.ig.state.cookieJar.setCookie(tc.toString(), `https://${tc.domain}${tc.path}`);
-loaded++;
-}
-this.log('INFO', `Loaded ${loaded}/${cookies.length} cookies`);
-}
+  async saveDevice(username) {
+    const dev = {
+      username,
+      deviceString: this.ig.state.deviceString,
+      deviceId: this.ig.state.deviceId,
+      uuid: this.ig.state.uuid,
+      phoneId: this.ig.state.phoneId,
+      adid: this.ig.state.adid,
+    };
+    await fs.writeFile(this.paths.device, JSON.stringify(dev, null, 2));
+    this.log('INFO', `Saved device fingerprint for @${username}`);
+  }
 
+  // ---------- Login Flow ----------
+  /**
+   * Enhanced login method with device persistence and structured flow
+   * @throws {Error} If login fails due to missing credentials or invalid session/cookies.
+   */
+  async login() {
+    const username = config.instagram?.username;
+    const password = config.instagram?.password;
+    const forceFresh = Boolean(config.instagram?.forceFreshLogin);
+
+    if (!username) throw new Error('INSTAGRAM_USERNAME is missing');
+
+    await this.initDevice(username);
+
+    if (!forceFresh) {
+      // 1) Try session.json
+      if (await this.trySessionLogin()) {
+        await this.postLogin();
+        return;
+      }
+
+      // 2) Try cookies.json
+      if (await this.tryCookieLogin()) {
+        await this.postLogin();
+        return;
+      }
+    } else {
+      this.log('INFO', 'forceFreshLogin=true, skipping session/cookies.');
+    }
+
+    // 3) Fresh login
+    if (!password) throw new Error('No valid login method; set instagram.password for fresh login.');
+    await this.freshLogin(username, password);
+    await this.postLogin();
+  }
+
+  async trySessionLogin() {
+    try {
+      const raw = await fs.readFile(this.paths.session, 'utf-8');
+      const sessionData = JSON.parse(raw);
+      await this.ig.state.deserialize(sessionData);
+      await this.ig.account.currentUser();
+      this.log('INFO', 'Logged in using session.json');
+      return true;
+    } catch (err) {
+      this.log('WARN', `Session login failed: ${err?.message || err}`);
+      return false;
+    }
+  }
+
+  async tryCookieLogin() {
+    try {
+      await this.loadCookiesFromJson(this.paths.cookies);
+      await this.ig.account.currentUser();
+      this.log('INFO', 'Logged in using cookies.json');
+      await this.saveSession();
+      return true;
+    } catch (err) {
+      this.log('WARN', `Cookie login failed: ${err?.message || err}`);
+      return false;
+    }
+  }
+
+  async freshLogin(username, password) {
+    try {
+      this.log('INFO', 'Attempting fresh login...');
+      await this.ig.account.login(username, password);
+      this.log('INFO', `Fresh login successful as @${username}`);
+      
+      // Add delay after fresh login to avoid rate limiting
+      this.log('INFO', 'Waiting 30 seconds after fresh login to avoid rate limits...');
+      await this.sleep(30000);
+      
+      await this.saveSession();
+    } catch (err) {
+      // Checkpoint flow (review/verify)
+      if (err instanceof IgCheckpointError || err?.name === 'IgCheckpointError') {
+        this.log('WARN', 'Checkpoint required. Attempting auto-resolution...');
+        try {
+          await this.ig.challenge.auto(true);
+          await this.ig.account.currentUser();
+          this.log('INFO', 'Checkpoint auto-resolved.');
+          await this.saveSession();
+          return;
+        } catch (e2) {
+          this.log('ERROR', `Checkpoint auto-resolution failed: ${e2?.message || e2}`);
+        }
+      }
+
+      throw err;
+    }
+  }
+
+  async saveSession() {
+    const session = await this.ig.state.serialize();
+    delete session.constants;
+    await fs.writeFile(this.paths.session, JSON.stringify(session, null, 2));
+    this.log('INFO', 'Session saved to session.json');
+  }
+
+  async loadCookiesFromJson(path) {
+    const raw = await fs.readFile(path, 'utf-8');
+    const cookies = JSON.parse(raw);
+    let loaded = 0;
+    for (const cookie of cookies) {
+      const tc = new tough.Cookie({
+        key: cookie.name,
+        value: cookie.value,
+        domain: (cookie.domain || '').replace(/^\./, ''),
+        path: cookie.path || '/',
+        secure: cookie.secure !== false,
+        httpOnly: cookie.httpOnly !== false,
+      });
+      await this.ig.state.cookieJar.setCookie(tc.toString(), `https://${tc.domain}${tc.path}`);
+      loaded++;
+    }
+    this.log('INFO', `Loaded ${loaded}/${cookies.length} cookies`);
+  }
+
+  /**
+   * Post-login setup: register handlers and connect to real-time
+   */
+  async postLogin() {
+    try {
       // Register handlers and connect to real-time
       this.registerRealtimeHandlers();
       await this.ig.realtime.connect({
@@ -100,41 +241,6 @@ this.log('INFO', `Loaded ${loaded}/${cookies.length} cookies`);
       this.log('INFO', 'Instagram bot is running and listening for messages');
     } catch (error) {
       this.log('ERROR', 'Failed to initialize bot:', error.message);
-      throw error;
-    }
-  }
-
-  /**
-   * Loads cookies from a JSON file.
-   * @param {string} path - Path to the cookies file.
-   * @throws {Error} If loading cookies fails.
-   */
-  async loadCookiesFromJson(path = './cookies.json') {
-    try {
-      const raw = await fs.readFile(path, 'utf-8');
-      const cookies = JSON.parse(raw);
-      let cookiesLoaded = 0;
-
-      for (const cookie of cookies) {
-        const toughCookie = new tough.Cookie({
-          key: cookie.name,
-          value: cookie.value,
-          domain: cookie.domain.replace(/^\./, ''),
-          path: cookie.path || '/',
-          secure: cookie.secure !== false,
-          httpOnly: cookie.httpOnly !== false,
-        });
-
-        await this.ig.state.cookieJar.setCookie(
-          toughCookie.toString(),
-          `https://${toughCookie.domain}${toughCookie.path}`
-        );
-        cookiesLoaded++;
-      }
-
-      this.log('INFO', `Loaded ${cookiesLoaded}/${cookies.length} cookies`);
-    } catch (error) {
-      this.log('ERROR', `Failed to load cookies from ${path}:`, error.message);
       throw error;
     }
   }
