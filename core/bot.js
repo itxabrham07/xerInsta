@@ -109,15 +109,6 @@ if (!loginSuccess) {
       throw err;
     }
   }
-            // Normally IG will send code (email/sms)
-            const code = await this.promptCode(); // helper function below
-            await this.ig.challenge.sendSecurityCode(code);
-
-            this.log('INFO', 'Challenge solved ✅');
-          } else {
-            throw err;
-          }
-        }
 
   // ✅ Save only session + device (no cookies dump)
   const session = await this.ig.state.serialize();
@@ -137,6 +128,7 @@ if (!loginSuccess) {
 
   loginSuccess = true;
 }
+
 
       if (!loginSuccess) throw new Error('No valid login method succeeded');
 
