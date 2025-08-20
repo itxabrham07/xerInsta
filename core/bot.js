@@ -40,118 +40,92 @@ class InstagramBot {
    * @throws {Error} If login fails due to missing credentials or invalid session/cookies.
    */
 async login() {
+  this.log('INFO', '📱 Connecting to Instagram...');
+
+  // Device state
   try {
-    const username = config.instagram?.username;
-    const password = config.instagram?.password;
-    if (!username || !password) throw new Error('Missing IG credentials');
-
-    // ✅ Device persistence
-    try {
-      const deviceState = JSON.parse(await fs.readFile('./device.json', 'utf-8'));
-      Object.assign(this.ig.state, deviceState);
+    if (fs.existsSync(this.devicePath)) {
+      const deviceState = JSON.parse(await fs.promises.readFile(this.devicePath, 'utf8'));
+      this.ig.state.deviceString = deviceState.deviceString;
+      this.ig.state.deviceId = deviceState.deviceId;
+      this.ig.state.uuid = deviceState.uuid;
+      this.ig.state.phoneId = deviceState.phoneId;
+      this.ig.state.adid = deviceState.adid;
       this.log('INFO', 'Loaded device.json ✅');
-    } catch {
-      this.ig.state.generateDevice(username);
-      this.log('INFO', 'Generated new device state');
+    } else {
+      this.ig.state.generateDevice(this.username);
     }
+  } catch (err) {
+    this.log('WARN', `Failed to load device.json: ${err.message}`);
+    this.ig.state.generateDevice(this.username);
+  }
 
-    let loginSuccess = false;
-
-    // ✅ 1) Try cookies.json
-    try {
-      const cookies = JSON.parse(await fs.readFile('./cookies.json', 'utf-8'));
+  // Cookie login
+  let loggedIn = false;
+  try {
+    if (fs.existsSync(this.cookiesPath)) {
+      const cookies = JSON.parse(await fs.promises.readFile(this.cookiesPath, 'utf8'));
       await this.ig.state.deserializeCookieJar(cookies);
-      await this.ig.account.currentUser();
-      this.log('INFO', 'Logged in using cookies.json ✅');
-      loginSuccess = true;
-    } catch (e) {
-      this.log('WARN', 'Cookies login failed:', e.message);
+      const user = await this.ig.account.currentUser();
+      this.log('INFO', `Cookie login as @${user.username} ✅`);
+      loggedIn = true;
     }
+  } catch (err) {
+    this.log('WARN', `Cookies login failed: ${err.message}`);
+  }
 
-    // ✅ 2) Try session.json
-    if (!loginSuccess) {
-      try {
-        const sessionData = JSON.parse(await fs.readFile('./session.json', 'utf-8'));
-        await this.ig.state.deserialize(sessionData);
-        await this.ig.account.currentUser();
-        this.log('INFO', 'Logged in using session.json ✅');
-        loginSuccess = true;
-      } catch (e) {
-        this.log('WARN', 'Session login failed:', e.message);
+  // Session login
+  if (!loggedIn) {
+    try {
+      if (fs.existsSync(this.sessionPath)) {
+        const session = JSON.parse(await fs.promises.readFile(this.sessionPath, 'utf8'));
+        await this.ig.state.deserialize(session);
+        const user = await this.ig.account.currentUser();
+        this.log('INFO', `Session login as @${user.username} ✅`);
+        loggedIn = true;
       }
+    } catch (err) {
+      this.log('WARN', `Session login failed: ${err.message}`);
     }
+  }
 
-    // ✅ 3) Fallback: Username/password
-    if (!loginSuccess) {
-      await this.ig.simulate.preLoginFlow();
+  // Fresh login
+  if (!loggedIn) {
+    this.log('INFO', 'Attempting fresh login with username/password...');
+    const user = await this.ig.account.login(this.username, this.password);
+    this.log('INFO', `Fresh login as @${user.username} ✅`);
+
+    // Save session + cookies + device
+    await fs.promises.writeFile(this.sessionPath, JSON.stringify(await this.ig.state.serialize()), 'utf8');
+    await fs.promises.writeFile(this.cookiesPath, JSON.stringify(await this.ig.state.serializeCookieJar()), 'utf8');
+    await fs.promises.writeFile(this.devicePath, JSON.stringify({
+      deviceString: this.ig.state.deviceString,
+      deviceId: this.ig.state.deviceId,
+      uuid: this.ig.state.uuid,
+      phoneId: this.ig.state.phoneId,
+      adid: this.ig.state.adid
+    }), 'utf8');
+    this.log('INFO', 'Session, cookies & device saved ✅');
+
+    // ⚠️ Fix crash: ignore fbsearch 404
+    process.nextTick(async () => {
       try {
-        const user = await this.ig.account.login(username, password);
-        this.log('INFO', `Fresh login as @${user.username} ✅`);
-        process.nextTick(async () => await this.ig.simulate.postLoginFlow());
+        await this.ig.simulate.postLoginFlow();
       } catch (err) {
-        if (err.name === 'IgChallengeError') {
-          this.log('WARN', 'Challenge required...');
-          await this.ig.challenge.auto(true);
-
-          const code = config.instagram?.challengeCode;
-          if (!code) throw new Error('Challenge code required. Set in config.');
-          await this.ig.challenge.sendSecurityCode(code);
-          this.log('INFO', 'Challenge solved ✅');
+        if (err.name === 'IgNotFoundError') {
+          this.log('WARN', 'postLoginFlow got 404 (ignored) ✅');
         } else {
-          throw err;
+          this.log('WARN', `postLoginFlow failed: ${err.message}`);
         }
       }
-
-      // ✅ Save session.json
-      const session = await this.ig.state.serialize();
-      delete session.constants;
-      await fs.writeFile('./session.json', JSON.stringify(session, null, 2));
-
-      // ✅ Save cookies.json
-      const cookies = await this.ig.state.serializeCookieJar();
-      await fs.writeFile('./cookies.json', JSON.stringify(cookies, null, 2));
-
-      // ✅ Save device.json
-      const deviceDump = {
-        deviceString: this.ig.state.deviceString,
-        deviceId: this.ig.state.deviceId,
-        uuid: this.ig.state.uuid,
-        phoneId: this.ig.state.phoneId,
-        adid: this.ig.state.adid,
-      };
-      await fs.writeFile('./device.json', JSON.stringify(deviceDump, null, 2));
-
-      this.log('INFO', 'Session, cookies & device saved ✅');
-
-      loginSuccess = true;
-    }
-
-    if (!loginSuccess) throw new Error('All login methods failed');
-
-    // ✅ Start realtime
-    this.registerRealtimeHandlers();
-    await this.ig.realtime.connect({
-      graphQlSubs: [
-        GraphQLSubscriptions.getAppPresenceSubscription(),
-        GraphQLSubscriptions.getDirectStatusSubscription(),
-        GraphQLSubscriptions.getDirectTypingSubscription(this.ig.state.cookieUserId),
-      ],
-      skywalkerSubs: [
-        SkywalkerSubscriptions.directSub(this.ig.state.cookieUserId),
-        SkywalkerSubscriptions.liveSub(this.ig.state.cookieUserId),
-      ],
-      irisData: await this.ig.feed.directInbox().request(),
     });
-
-    await this.setForegroundState(true, true, 60);
-    this.isRunning = true;
-    this.log('INFO', 'Bot is running 🚀');
-  } catch (error) {
-    this.log('ERROR', 'Login failed:', error.message);
-    throw error;
   }
-}
 
+  // ✅ Connect realtime (no fbns needed)
+  this.log('INFO', 'Registering real-time event handlers...');
+  this.realtime = withRealtime(this.ig);
+  await this.realtime.connect({ irisData: await this.ig.feed.directInbox().request() });
+}
 
 
   /**
