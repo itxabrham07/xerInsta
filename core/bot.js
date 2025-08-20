@@ -8,13 +8,13 @@ import { MessageHandler } from './message-handler.js';
 import { config } from '../config.js';
 
 /**
- * InstagramBot — Enhanced version with better error handling
+ * InstagramBot — robust version with enhanced error handling
  * - Persistent device fingerprint (device.json)
  * - Login order: session.json -> cookies.json -> fresh username/password
  * - Optional 2FA support (reads config.instagram.twoFactorCode or TOTP via config.instagram.totpSecret if otplib is available)
- * - Realtime reconnect with backoff and retry logic
+ * - Realtime reconnect with backoff
  * - Human-like jitter for heartbeats & foreground state
- * - Better error handling for Instagram API issues
+ * - Enhanced error handling for API issues
  */
 class InstagramBot {
   constructor(options = {}) {
@@ -24,7 +24,6 @@ class InstagramBot {
     this.processedMessageIds = new Set();
     this.maxProcessedMessageIds = 1000;
     this.userCache = new Map();
-    this.isRealtimeConnected = false;
 
     this.paths = {
       device: options.devicePath || './device.json',
@@ -36,7 +35,7 @@ class InstagramBot {
     this.foregroundTimer = null;
     this.reconnectAttempt = 0;
     this.maxReconnectAttempts = 10;
-    this.realtimeRetryDelay = 30000; // 30 seconds initial delay
+    this.realtimeConnected = false;
   }
 
   log(level, message, ...args) {
@@ -83,7 +82,7 @@ class InstagramBot {
   // ---------- Login Flow ----------
   async login() {
     const username = config.instagram?.username;
-    const password = config.instagram?.password;
+    const password = config.instagram?.password; // optional for fresh login
     const forceFresh = Boolean(config.instagram?.forceFreshLogin);
 
     if (!username) throw new Error('INSTAGRAM_USERNAME is missing');
@@ -144,11 +143,6 @@ class InstagramBot {
       this.log('INFO', 'Attempting fresh login...');
       await this.ig.account.login(username, password);
       this.log('INFO', `Fresh login successful as @${username}`);
-      
-      // Add delay after fresh login to avoid rate limiting
-      this.log('INFO', 'Waiting 30 seconds after fresh login to avoid rate limits...');
-      await this.sleep(30000);
-      
       await this.saveSession();
     } catch (err) {
       // 2FA flow
@@ -171,19 +165,20 @@ class InstagramBot {
         }
       }
 
-      throw err;
+      throw err; // bubble up if not handled
     }
   }
 
   async handleTwoFactorLogin(error, username, password) {
     const { two_factor_info: info } = error;
     const identifier = info?.two_factor_identifier;
-    const totp = info?.totp_two_factor_on;
+    const totp = info?.totp_two_factor_on; // if true, authenticator app is allowed
 
     if (!identifier) throw new Error('2FA required but no identifier provided by Instagram.');
 
     let code = (config.instagram?.twoFactorCode || '').toString().trim();
 
+    // If no static code, try TOTP via otplib if totp is enabled and secret is provided
     if (!code && totp && config.instagram?.totpSecret) {
       try {
         const { totp: totpGen } = await import('otplib');
@@ -203,7 +198,7 @@ class InstagramBot {
       password,
       twoFactorIdentifier: identifier,
       verificationCode: code,
-      verificationMethod: method,
+      verificationMethod: method, // '0' = TOTP/app, '1' = SMS
       trustThisDevice: true,
     });
 
@@ -237,94 +232,128 @@ class InstagramBot {
     this.log('INFO', `Loaded ${loaded}/${cookies.length} cookies`);
   }
 
-  // ---------- Enhanced Realtime Connection ----------
+  // ---------- Realtime ----------
   async postLogin() {
     this.registerRealtimeHandlers();
     
-    // Try to connect to realtime with retries
-    await this.connectRealtimeWithRetry();
+    // Add delay after fresh login to avoid rate limiting
+    this.log('INFO', 'Waiting before connecting to realtime...');
+    await this.sleep(this.rand(3000, 8000));
+    
+    await this.connectRealtime();
 
-    this.isRunning = true;
-
-    // Start jittered tasks only if realtime is connected
-    if (this.isRealtimeConnected) {
+    // Initial foreground presence only if realtime is connected
+    if (this.realtimeConnected) {
       await this.setForegroundState(true, true, 60 + this.rand(-10, 10));
+      this.isRunning = true;
+
+      // Start jittered tasks
       this.scheduleHeartbeat();
       this.scheduleForegroundCycles();
-    } else {
-      this.log('WARN', 'Realtime not connected, running in polling mode');
-      // You could implement a polling mechanism here as fallback
-    }
-  }
-
-  async connectRealtimeWithRetry() {
-    const maxAttempts = 5;
-    let attempt = 0;
-    
-    while (attempt < maxAttempts && !this.isRealtimeConnected) {
-      attempt++;
-      try {
-        this.log('INFO', `Attempting realtime connection (attempt ${attempt}/${maxAttempts})`);
-        await this.connectRealtime();
-        this.isRealtimeConnected = true;
-        this.log('INFO', 'Realtime connection successful');
-        return;
-      } catch (error) {
-        this.log('ERROR', `Realtime connection attempt ${attempt} failed: ${error?.message || error}`);
-        
-        if (attempt < maxAttempts) {
-          const delay = this.realtimeRetryDelay * attempt; // Progressive delay
-          this.log('INFO', `Waiting ${delay/1000}s before retry...`);
-          await this.sleep(delay);
-        }
-      }
-    }
-    
-    if (!this.isRealtimeConnected) {
-      this.log('ERROR', 'Failed to establish realtime connection after all attempts');
-      // Don't throw error, allow bot to continue without realtime
     }
   }
 
   async connectRealtime() {
-    const socksOptions = config.proxy
-      ? {
-          type: config.proxy.type || 5,
-          host: config.proxy.host,
-          port: config.proxy.port,
-          userId: config.proxy.username,
-          password: config.proxy.password,
-        }
-      : undefined;
+    const maxRetries = 5;
+    let attempt = 0;
 
-    // Try to get inbox data with error handling
-    let irisData;
-    try {
-      this.log('INFO', 'Fetching inbox data for realtime connection...');
-      irisData = await this.ig.feed.directInbox().request();
-      this.log('INFO', 'Inbox data fetched successfully');
-    } catch (error) {
-      this.log('WARN', `Failed to fetch inbox data: ${error?.message || error}`);
-      // Try with minimal data or skip iris data
-      irisData = null;
+    while (attempt < maxRetries && !this.realtimeConnected) {
+      try {
+        attempt++;
+        this.log('INFO', `Attempting realtime connection (${attempt}/${maxRetries})...`);
+
+        const socksOptions = config.proxy
+          ? {
+              type: config.proxy.type || 5,
+              host: config.proxy.host,
+              port: config.proxy.port,
+              userId: config.proxy.username,
+              password: config.proxy.password,
+            }
+          : undefined;
+
+        // Try to get inbox data with retries and fallback
+        let irisData = null;
+        try {
+          // Add delay before fetching inbox
+          await this.sleep(this.rand(2000, 5000));
+          irisData = await this.getInboxDataWithRetry();
+        } catch (inboxError) {
+          this.log('WARN', `Failed to get inbox data: ${inboxError.message}. Proceeding without iris data.`);
+          // Continue without iris data - realtime can still work
+        }
+
+        await this.ig.realtime.connect({
+          graphQlSubs: [
+            GraphQLSubscriptions.getAppPresenceSubscription(),
+            GraphQLSubscriptions.getZeroProvisionSubscription(this.ig.state.phoneId),
+            GraphQLSubscriptions.getDirectStatusSubscription(),
+            GraphQLSubscriptions.getDirectTypingSubscription(this.ig.state.cookieUserId),
+            GraphQLSubscriptions.getAsyncAdSubscription(this.ig.state.cookieUserId),
+          ],
+          skywalkerSubs: [
+            SkywalkerSubscriptions.directSub(this.ig.state.cookieUserId),
+            SkywalkerSubscriptions.liveSub(this.ig.state.cookieUserId),
+          ],
+          irisData, // This can be null if inbox fetch failed
+          connectOverrides: {},
+          socksOptions,
+        });
+
+        this.realtimeConnected = true;
+        this.log('INFO', 'Realtime connection established successfully');
+        return;
+
+      } catch (error) {
+        this.log('ERROR', `Realtime connection attempt ${attempt} failed: ${error.message}`);
+        
+        if (attempt < maxRetries) {
+          const delay = Math.min(30000, 5000 * Math.pow(2, attempt - 1));
+          this.log('INFO', `Retrying in ${delay / 1000}s...`);
+          await this.sleep(delay);
+        }
+      }
     }
 
-    await this.ig.realtime.connect({
-      graphQlSubs: [
-        GraphQLSubscriptions.getAppPresenceSubscription(),
-        GraphQLSubscriptions.getZeroProvisionSubscription(this.ig.state.phoneId),
-        GraphQLSubscriptions.getDirectStatusSubscription(),
-        GraphQLSubscriptions.getDirectTypingSubscription(this.ig.state.cookieUserId),
-        GraphQLSubscriptions.getAsyncAdSubscription(this.ig.state.cookieUserId),
-      ],
-      skywalkerSubs: [
-        SkywalkerSubscriptions.directSub(this.ig.state.cookieUserId),
-        SkywalkerSubscriptions.liveSub(this.ig.state.cookieUserId),
-      ],
-      irisData: irisData, // This might be null if inbox fetch failed
-      connectOverrides: {},
-      socksOptions,
-    });
+    if (!this.realtimeConnected) {
+      this.log('WARN', 'Failed to establish realtime connection after all attempts. Bot will continue without realtime features.');
+      // Don't throw error, allow bot to continue in polling mode if needed
+    }
+  }
+
+  async getInboxDataWithRetry(maxRetries = 3) {
+    let lastError;
+    
+    for (let i = 0; i < maxRetries; i++) {
+      try {
+        if (i > 0) {
+          const delay = 1000 * Math.pow(2, i);
+          this.log('INFO', `Retrying inbox fetch in ${delay / 1000}s...`);
+          await this.sleep(delay);
+        }
+
+        // Try different inbox fetch approaches
+        const inboxFeed = this.ig.feed.directInbox();
+        
+        // Set more conservative parameters
+        inboxFeed.limit = 10; // Reduce limit
+        
+        const result = await inboxFeed.request();
+        this.log('INFO', 'Successfully fetched inbox data');
+        return result;
+        
+      } catch (error) {
+        lastError = error;
+        this.log('WARN', `Inbox fetch attempt ${i + 1} failed: ${error.message}`);
+        
+        // If it's a 500 error, wait longer between retries
+        if (error.message.includes('500')) {
+          await this.sleep(this.rand(5000, 10000));
+        }
+      }
+    }
+    
+    throw lastError;
   }
 
   registerRealtimeHandlers() {
@@ -360,21 +389,21 @@ class InstagramBot {
 
     this.ig.realtime.on('connect', () => {
       this.log('INFO', 'Realtime connected');
-      this.isRealtimeConnected = true;
       this.isRunning = true;
-      this.reconnectAttempt = 0;
+      this.realtimeConnected = true;
+      this.reconnectAttempt = 0; // reset backoff
     });
 
     this.ig.realtime.on('close', async () => {
       this.log('WARN', 'Realtime connection closed');
-      this.isRealtimeConnected = false;
       this.isRunning = false;
+      this.realtimeConnected = false;
       await this.scheduleReconnect();
     });
 
     this.ig.realtime.on('error', async (err) => {
       this.log('ERROR', `Realtime error: ${err?.message || err}`);
-      this.isRealtimeConnected = false;
+      this.realtimeConnected = false;
       await this.scheduleReconnect();
     });
 
@@ -385,12 +414,12 @@ class InstagramBot {
 
   async scheduleReconnect() {
     if (this.reconnectAttempt >= this.maxReconnectAttempts) {
-      this.log('ERROR', `Max reconnect attempts (${this.maxReconnectAttempts}) reached. Stopping reconnect attempts.`);
+      this.log('ERROR', `Max reconnection attempts (${this.maxReconnectAttempts}) reached. Stopping reconnection attempts.`);
       return;
     }
 
-    // Exponential backoff with jitter: base 30s up to ~15min
-    const base = Math.min(15 * 60_000, this.realtimeRetryDelay * Math.pow(2, this.reconnectAttempt));
+    // Exponential backoff with jitter: base 2s up to ~60s
+    const base = Math.min(60000, 2000 * Math.pow(2, this.reconnectAttempt));
     const delay = this.jitter(base, 0.2);
     this.reconnectAttempt++;
     this.log('INFO', `Scheduling reconnect in ${Math.round(delay / 1000)}s (attempt ${this.reconnectAttempt})`);
@@ -399,11 +428,9 @@ class InstagramBot {
     
     try {
       await this.connectRealtime();
-      this.isRealtimeConnected = true;
-      this.reconnectAttempt = 0; // Reset on successful connection
     } catch (e) {
       this.log('ERROR', `Reconnect failed: ${e?.message || e}`);
-      // Schedule another reconnect
+      // try again later
       await this.scheduleReconnect();
     }
   }
@@ -423,7 +450,6 @@ class InstagramBot {
   async getUsername(userId) {
     if (!userId) return `user_${userId || 'unknown'}`;
     if (this.userCache.has(userId)) return this.userCache.get(userId);
-    
     try {
       const userInfo = await this.ig.user.info(userId);
       const username = userInfo.username || `user_${userId}`;
@@ -484,22 +510,16 @@ class InstagramBot {
 
   async sendMessage(threadId, text) {
     if (!threadId || !text) throw new Error('Thread ID and text are required');
-    
-    try {
-      await this.sleep(this.rand(1000, 3000)); // Human-like delay
-      await this.ig.entity.directThread(threadId).broadcastText(text);
-      this.log('INFO', `Text message sent to thread ${threadId}: "${text}"`);
-      return true;
-    } catch (error) {
-      this.log('ERROR', `Failed to send message: ${error?.message || error}`);
-      throw error;
-    }
+    await this.sleep(this.rand(300, 1500)); // small human-like delay
+    await this.ig.entity.directThread(threadId).broadcastText(text);
+    this.log('INFO', `Text message sent to thread ${threadId}: "${text}"`);
+    return true;
   }
 
-  // ---------- Enhanced Foreground / Presence Simulation ----------
+  // ---------- Foreground / Presence Simulation ----------
   async setForegroundState(inApp = true, inDevice = true, timeoutSeconds = 60) {
-    if (!this.isRealtimeConnected) {
-      this.log('WARN', 'Cannot set foreground state: realtime not connected');
+    if (!this.realtimeConnected || !this.ig.realtime?.direct?.sendForegroundState) {
+      this.log('WARN', 'Cannot set foreground state: realtime not connected or method unavailable');
       return false;
     }
 
@@ -519,19 +539,20 @@ class InstagramBot {
   }
 
   scheduleForegroundCycles() {
-    if (!this.isRealtimeConnected) {
+    if (!this.realtimeConnected) {
       this.log('WARN', 'Skipping foreground cycles: realtime not connected');
       return;
     }
 
+    // Simulate user sometimes backgrounding the app
     const runCycle = async () => {
-      if (!this.isRealtimeConnected) return; // Stop if disconnected
+      if (!this.realtimeConnected || !this.isRunning) return;
       
       // App goes background for 5–20 min
       await this.setForegroundState(false, false, 900);
       await this.sleep(this.rand(5 * 60_000, 20 * 60_000));
       
-      if (!this.isRealtimeConnected) return; // Check again
+      if (!this.realtimeConnected || !this.isRunning) return;
       
       // Back to foreground for 1–10 min
       await this.setForegroundState(true, true, 60 + this.rand(-10, 10));
@@ -542,59 +563,51 @@ class InstagramBot {
       }
     };
 
-    // Start after a short random delay
+    // start after a short random delay
     this.foregroundTimer = setTimeout(runCycle, this.rand(60_000, 5 * 60_000));
   }
 
   // ---------- Heartbeat ----------
   scheduleHeartbeat() {
     const run = () => {
-      this.log('INFO', `[Heartbeat] Running: ${this.isRunning}, Realtime: ${this.isRealtimeConnected}`);
+      if (!this.isRunning) return;
+      
+      this.log('INFO', `[Heartbeat] Running: ${this.isRunning}, Realtime: ${this.realtimeConnected}`);
+      const next = this.jitter(5 * 60_000, 0.4); // ~5min ±40%
       
       if (this.isRunning) {
-        const next = this.jitter(5 * 60_000, 0.4); // ~5min ±40%
         this.heartbeatTimer = setTimeout(run, next);
       }
     };
-    
-    const first = this.jitter(2 * 60_000, 0.5); // First after ~2min ±50%
+    const first = this.jitter(2 * 60_000, 0.5); // first after ~2min ±50%
     this.heartbeatTimer = setTimeout(run, first);
   }
 
-  // ---------- Enhanced Graceful Disconnect ----------
+  // ---------- Graceful Disconnect ----------
   async disconnect() {
     this.log('INFO', 'Initiating graceful disconnect...');
     this.isRunning = false;
 
-    if (this.isRealtimeConnected) {
-      try {
+    try {
+      if (this.realtimeConnected) {
         await this.setForegroundState(false, false, 900);
-      } catch (error) {
-        this.log('WARN', `Error setting background state: ${error?.message || error}`);
       }
+    } catch (error) {
+      this.log('WARN', `Error setting background state: ${error?.message || error}`);
     }
 
     try {
       if (this.ig.realtime?.disconnect) {
         await this.ig.realtime.disconnect();
         this.log('INFO', 'Disconnected from Instagram realtime');
-        this.isRealtimeConnected = false;
+        this.realtimeConnected = false;
       }
     } catch (error) {
       this.log('WARN', `Error during disconnect: ${error?.message || error}`);
     }
 
-    if (this.heartbeatTimer) {
-      clearTimeout(this.heartbeatTimer);
-      this.heartbeatTimer = null;
-    }
-    
-    if (this.foregroundTimer) {
-      clearTimeout(this.foregroundTimer);
-      this.foregroundTimer = null;
-    }
-
-    this.log('INFO', 'Disconnect complete');
+    if (this.heartbeatTimer) clearTimeout(this.heartbeatTimer);
+    if (this.foregroundTimer) clearTimeout(this.foregroundTimer);
   }
 
   // ---------- Utils ----------
@@ -610,32 +623,15 @@ class InstagramBot {
   sleep(ms) {
     return new Promise((res) => setTimeout(res, ms));
   }
-
-  // ---------- Health Check Methods ----------
-  isHealthy() {
-    return this.isRunning && this.isRealtimeConnected;
-  }
-
-  getStatus() {
-    return {
-      isRunning: this.isRunning,
-      isRealtimeConnected: this.isRealtimeConnected,
-      reconnectAttempt: this.reconnectAttempt,
-      processedMessages: this.processedMessageIds.size,
-      cachedUsers: this.userCache.size,
-    };
-  }
 }
 
 /**
- * Main execution logic for the bot with enhanced error handling.
+ * Main execution logic for the bot.
  */
 async function main() {
   let bot;
   try {
     bot = new InstagramBot();
-    
-    console.log('🚀 Starting Instagram Bot...');
     await bot.login();
 
     const moduleManager = new ModuleManager(bot);
@@ -644,39 +640,19 @@ async function main() {
     const messageHandler = new MessageHandler(bot, moduleManager, null);
     bot.onMessage((message) => messageHandler.handleMessage(message));
 
-    console.log('✅ Bot is running with full module support. Type .help for commands.');
-    console.log(`📊 Bot Status: ${JSON.stringify(bot.getStatus(), null, 2)}`);
-
-    // Health check interval
-    setInterval(() => {
-      const status = bot.getStatus();
-      console.log(`💓 Health Check: ${JSON.stringify(status, null, 2)}`);
-    }, 5 * 60_000); // Every 5 minutes
+    console.log('Bot is running with full module support. Type .help for commands.');
 
     const shutdownHandler = async () => {
-      console.log('\n🛑 [SIGINT/SIGTERM] Shutting down gracefully...');
+      console.log('\n[SIGINT/SIGTERM] Shutting down gracefully...');
       if (bot) await bot.disconnect();
-      console.log('✅ Shutdown complete.');
+      console.log('Shutdown complete.');
       process.exit(0);
     };
 
     process.on('SIGINT', shutdownHandler);
     process.on('SIGTERM', shutdownHandler);
-    
-    // Handle uncaught exceptions
-    process.on('uncaughtException', async (error) => {
-      console.error('❌ Uncaught Exception:', error);
-      if (bot) await bot.disconnect();
-      process.exit(1);
-    });
-
-    process.on('unhandledRejection', async (reason, promise) => {
-      console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
-      // Don't exit on unhandled rejection, just log it
-    });
-
   } catch (error) {
-    console.error('❌ Bot failed to start:', error?.message || error);
+    console.error('Bot failed to start:', error?.message || error);
     if (bot) await bot.disconnect();
     process.exit(1);
   }
@@ -684,7 +660,7 @@ async function main() {
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   main().catch((error) => {
-    console.error('❌ Unhandled error in main:', error?.message || error);
+    console.error('Unhandled error in main:', error?.message || error);
     process.exit(1);
   });
 }
