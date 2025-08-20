@@ -6,8 +6,6 @@ import tough from 'tough-cookie';
 import { ModuleManager } from './module-manager.js';
 import { MessageHandler } from './message-handler.js';
 import { config } from '../config.js';
-import crypto from 'crypto';
-import path from 'path';
 
 /**
  * InstagramBot class to manage Instagram interactions via the private API and MQTT.
@@ -24,10 +22,6 @@ class InstagramBot {
     this.processedMessageIds = new Set();
     this.maxProcessedMessageIds = 1000;
     this.userCache = new Map(); // Cache for user info
-    this.deviceDataPath = './device.json';
-    this.sessionPath = './session.json';
-    this.cookiesPath = './cookies.json';
-    this.fingerprintPath = './fingerprint.json';
   }
 
   /**
@@ -42,309 +36,47 @@ class InstagramBot {
   }
 
   /**
-   * Generates a unique device fingerprint based on username
-   * @param {string} username - Instagram username
-   * @returns {object} Device fingerprint data
+   * Logs in to Instagram using session or cookies.
+   * @throws {Error} If login fails due to missing credentials or invalid session/cookies.
    */
-  generateDeviceFingerprint(username) {
-    const seed = `${username}_${Date.now()}`;
-    const hash = crypto.createHash('md5').update(seed).digest('hex');
-    
-    return {
-      deviceId: `android-${hash.substring(0, 16)}`,
-      phoneId: crypto.randomUUID(),
-      uuid: crypto.randomUUID(),
-      advertisingId: crypto.randomUUID(),
-      androidVersion: 29,
-      androidRelease: '10',
-      dpi: '480dpi',
-      resolution: '1080x2340',
-      manufacturer: 'OnePlus',
-      model: 'ONEPLUS A6000',
-      device: 'OnePlus6',
-      cpu: 'qcom',
-      lastLogin: new Date().toISOString(),
-      created: new Date().toISOString()
-    };
-  }
-
-  /**
-   * Saves device fingerprint to file
-   * @param {object} fingerprint - Device fingerprint data
-   */
-  async saveDeviceFingerprint(fingerprint) {
-    try {
-      await fs.writeFile(this.fingerprintPath, JSON.stringify(fingerprint, null, 2));
-      this.log('INFO', 'Device fingerprint saved successfully');
-    } catch (error) {
-      this.log('ERROR', 'Failed to save device fingerprint:', error.message);
-    }
-  }
-
-  /**
-   * Loads device fingerprint from file
-   * @returns {object|null} Device fingerprint data or null if not found
-   */
-  async loadDeviceFingerprint() {
-    try {
-      await fs.access(this.fingerprintPath);
-      const data = JSON.parse(await fs.readFile(this.fingerprintPath, 'utf-8'));
-      this.log('INFO', 'Device fingerprint loaded successfully');
-      return data;
-    } catch (error) {
-      this.log('WARN', 'Device fingerprint not found or invalid');
-      return null;
-    }
-  }
-
-  /**
-   * Sets up device with persistent fingerprint
-   * @param {string} username - Instagram username
-   */
-  async setupPersistentDevice(username) {
-    let fingerprint = await this.loadDeviceFingerprint();
-    
-    if (!fingerprint) {
-      fingerprint = this.generateDeviceFingerprint(username);
-      await this.saveDeviceFingerprint(fingerprint);
-    } else {
-      // Update last login time
-      fingerprint.lastLogin = new Date().toISOString();
-      await this.saveDeviceFingerprint(fingerprint);
-    }
-
-    // Apply device settings to Instagram client
-    this.ig.state.deviceString = fingerprint.deviceId;
-    this.ig.state.phoneId = fingerprint.phoneId;
-    this.ig.state.uuid = fingerprint.uuid;
-    this.ig.state.advertisingId = fingerprint.advertisingId;
-    
-    // Set device info
-    this.ig.state.deviceId = fingerprint.deviceId;
-    this.ig.state.build = '29.0.0.0.62';
-    
-    this.log('INFO', `Device fingerprint applied for ${username}`);
-    return fingerprint;
-  }
-
-  /**
-   * Checkpoint auto-resolver
-   * @param {object} challenge - Challenge object from Instagram
-   */
-  async resolveCheckpoint(challenge) {
-    try {
-      this.log('INFO', 'Checkpoint detected, attempting auto-resolution...');
-      
-      if (challenge.step_name === 'select_verify_method') {
-        // Try to select email verification if available
-        const choices = challenge.step_data?.choice_list || [];
-        const emailChoice = choices.find(choice => choice.label && choice.label.includes('email'));
-        
-        if (emailChoice) {
-          this.log('INFO', 'Selecting email verification method...');
-          await this.ig.challenge.selectVerifyMethod(challenge.step_name, emailChoice.value);
-          return true;
-        }
-      }
-      
-      if (challenge.step_name === 'verify_email') {
-        this.log('WARN', 'Email verification required. Please check your email and enter code manually.');
-        // In a real scenario, you might want to implement email code retrieval
-        return false;
-      }
-      
-      // Try to bypass certain challenges
-      if (challenge.step_name === 'submit_phone') {
-        this.log('INFO', 'Attempting to skip phone verification...');
-        // Try to skip or use alternative method
-        return false;
-      }
-      
-      this.log('WARN', `Unhandled checkpoint step: ${challenge.step_name}`);
-      return false;
-      
-    } catch (error) {
-      this.log('ERROR', 'Checkpoint resolution failed:', error.message);
-      return false;
-    }
-  }
-
-  /**
-   * Fresh login with username and password, bypassing 2FA
-   * @param {string} username - Instagram username
-   * @param {string} password - Instagram password
-   * @param {boolean} bypassTwoFactor - Whether to attempt 2FA bypass
-   */
-  async freshLogin(username, password, bypassTwoFactor = true) {
-    try {
-      this.log('INFO', `Attempting fresh login for ${username}...`);
-      
-      // Setup persistent device fingerprint
-      await this.setupPersistentDevice(username);
-      
-      // Pre-login setup
-      this.ig.request.end$.subscribe(async () => {
-        await this.delay(Math.floor(Math.random() * 1000) + 500);
-      });
-      
-      // Simulate app startup sequence
-      await this.ig.simulate.preLoginFlow();
-      
-      let loginAttempted = false;
-      let loginSuccess = false;
-      
-      while (!loginSuccess && !loginAttempted) {
-        try {
-          loginAttempted = true;
-          
-          // Attempt login
-          const loginResponse = await this.ig.account.login(username, password);
-          
-          if (loginResponse) {
-            this.log('INFO', 'Login successful!');
-            loginSuccess = true;
-            
-            // Save session after successful login
-            const session = await this.ig.state.serialize();
-            delete session.constants;
-            await fs.writeFile(this.sessionPath, JSON.stringify(session, null, 2));
-            this.log('INFO', 'Session saved successfully');
-            
-            return true;
-          }
-          
-        } catch (error) {
-          this.log('WARN', 'Login attempt failed:', error.message);
-          
-          // Handle different error scenarios
-          if (error.name === 'IgCheckpointError') {
-            this.log('INFO', 'Checkpoint challenge detected');
-            const resolved = await this.resolveCheckpoint(error.checkpoint);
-            if (!resolved) {
-              this.log('ERROR', 'Failed to resolve checkpoint automatically');
-              throw error;
-            }
-            loginAttempted = false; // Try login again after checkpoint resolution
-          } 
-          else if (error.name === 'IgLoginTwoFactorRequiredError' && bypassTwoFactor) {
-            this.log('INFO', 'Attempting to bypass two-factor authentication...');
-            try {
-              // Try to use backup codes or trusted device approach
-              const twoFactorInfo = error.response.body.two_factor_info;
-              
-              if (twoFactorInfo.backup_codes && twoFactorInfo.backup_codes.length > 0) {
-                this.log('INFO', 'Using backup codes for 2FA bypass...');
-                // This is a simplified approach - in reality you'd need stored backup codes
-                throw new Error('2FA backup codes required but not implemented');
-              }
-              
-              // Try to mark device as trusted
-              this.log('INFO', 'Attempting to use trusted device method...');
-              // This would require implementing device trust mechanism
-              throw error;
-              
-            } catch (twoFactorError) {
-              this.log('ERROR', '2FA bypass failed:', twoFactorError.message);
-              if (!bypassTwoFactor) {
-                throw error;
-              }
-              // Continue with normal 2FA flow if bypass fails
-              throw error;
-            }
-          } 
-          else if (error.name === 'IgLoginBadPasswordError') {
-            this.log('ERROR', 'Invalid password provided');
-            throw error;
-          }
-          else if (error.name === 'IgLoginInvalidUserError') {
-            this.log('ERROR', 'Invalid username provided');
-            throw error;
-          }
-          else {
-            this.log('ERROR', 'Unknown login error:', error.message);
-            throw error;
-          }
-        }
-      }
-      
-      return false;
-      
-    } catch (error) {
-      this.log('ERROR', 'Fresh login failed:', error.message);
-      throw error;
-    }
-  }
-
-  /**
-   * Enhanced login method with multiple fallback options
-   * @param {boolean} useFreshLogin - Whether to use fresh login
-   */
-  async login(useFreshLogin = false) {
+  async login() {
     try {
       const username = config.instagram?.username;
-      const password = config.instagram?.password;
-      
       if (!username) {
         throw new Error('INSTAGRAM_USERNAME is missing');
       }
 
+      this.ig.state.generateDevice(username); // Simulates mobile device
       let loginSuccess = false;
 
-      // If fresh login is requested and password is available
-      if (useFreshLogin && password) {
-        try {
-          this.log('INFO', 'Attempting fresh login with credentials...');
-          loginSuccess = await this.freshLogin(username, password);
-        } catch (freshError) {
-          this.log('WARN', 'Fresh login failed, falling back to session/cookie login:', freshError.message);
-        }
+      // Attempt login with session
+      try {
+        await fs.access('./session.json');
+        this.log('INFO', 'Found session.json, attempting session-based login...');
+        const sessionData = JSON.parse(await fs.readFile('./session.json', 'utf-8'));
+        await this.ig.state.deserialize(sessionData);
+        await this.ig.account.currentUser();
+        this.log('INFO', 'Logged in from session.json');
+        loginSuccess = true;
+      } catch (sessionError) {
+        this.log('WARN', 'Session login failed:', sessionError.message);
       }
 
-      // Fallback to existing session if fresh login wasn't used or failed
+      // Fallback to cookies if session login fails
       if (!loginSuccess) {
-        await this.setupPersistentDevice(username);
-        
-        // Attempt login with session
         try {
-          await fs.access(this.sessionPath);
-          this.log('INFO', 'Found session.json, attempting session-based login...');
-          const sessionData = JSON.parse(await fs.readFile(this.sessionPath, 'utf-8'));
-          await this.ig.state.deserialize(sessionData);
-          await this.ig.account.currentUser();
-          this.log('INFO', 'Logged in from session.json');
+          this.log('INFO', 'Attempting login using cookies.json...');
+          await this.loadCookiesFromJson('./cookies.json');
+          const user = await this.ig.account.currentUser();
+          this.log('INFO', `Logged in using cookies.json as @${user.username}`);
+          const session = await this.ig.state.serialize();
+          delete session.constants;
+          await fs.writeFile('./session.json', JSON.stringify(session, null, 2));
+          this.log('INFO', 'Session saved to session.json');
           loginSuccess = true;
-        } catch (sessionError) {
-          this.log('WARN', 'Session login failed:', sessionError.message);
-        }
-
-        // Fallback to cookies if session login fails
-        if (!loginSuccess) {
-          try {
-            this.log('INFO', 'Attempting login using cookies.json...');
-            await this.loadCookiesFromJson(this.cookiesPath);
-            const user = await this.ig.account.currentUser();
-            this.log('INFO', `Logged in using cookies.json as @${user.username}`);
-            const session = await this.ig.state.serialize();
-            delete session.constants;
-            await fs.writeFile(this.sessionPath, JSON.stringify(session, null, 2));
-            this.log('INFO', 'Session saved to session.json');
-            loginSuccess = true;
-          } catch (cookieError) {
-            this.log('ERROR', 'Failed to login with cookies:', cookieError.message);
-            
-            // Last resort: try fresh login if credentials are available and not already attempted
-            if (!useFreshLogin && password) {
-              this.log('INFO', 'Attempting fresh login as last resort...');
-              try {
-                loginSuccess = await this.freshLogin(username, password);
-              } catch (lastResortError) {
-                this.log('ERROR', 'Last resort fresh login failed:', lastResortError.message);
-                throw new Error(`All login methods failed. Last error: ${lastResortError.message}`);
-              }
-            } else {
-              throw new Error(`Cookie login failed: ${cookieError.message}`);
-            }
-          }
+        } catch (cookieError) {
+          this.log('ERROR', 'Failed to login with cookies:', cookieError.message);
+          throw new Error(`Cookie login failed: ${cookieError.message}`);
         }
       }
 
@@ -385,14 +117,6 @@ class InstagramBot {
       this.log('ERROR', 'Failed to initialize bot:', error.message);
       throw error;
     }
-  }
-
-  /**
-   * Utility delay function
-   * @param {number} ms - Milliseconds to delay
-   */
-  async delay(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   /**
@@ -651,51 +375,6 @@ class InstagramBot {
   }
 
   /**
-   * Clears all stored authentication data for fresh start
-   */
-  async clearAuthData() {
-    const filesToClear = [
-      this.sessionPath,
-      this.cookiesPath,
-      this.fingerprintPath,
-      this.deviceDataPath
-    ];
-
-    for (const filePath of filesToClear) {
-      try {
-        await fs.unlink(filePath);
-        this.log('INFO', `Cleared: ${filePath}`);
-      } catch (error) {
-        // File doesn't exist, which is fine
-        if (error.code !== 'ENOENT') {
-          this.log('WARN', `Failed to clear ${filePath}:`, error.message);
-        }
-      }
-    }
-    
-    this.log('INFO', 'All authentication data cleared');
-  }
-
-  /**
-   * Forces a fresh login by clearing existing data
-   * @param {boolean} clearData - Whether to clear existing auth data
-   */
-  async forceRefreshLogin(clearData = true) {
-    if (clearData) {
-      await this.clearAuthData();
-    }
-    
-    const username = config.instagram?.username;
-    const password = config.instagram?.password;
-    
-    if (!username || !password) {
-      throw new Error('Username and password required for fresh login');
-    }
-    
-    return await this.freshLogin(username, password);
-  }
-
-  /**
    * Gracefully disconnects the bot.
    */
   async disconnect() {
@@ -726,11 +405,7 @@ async function main() {
   let bot;
   try {
     bot = new InstagramBot();
-    
-    // Check if fresh login is requested via environment variable or command line
-    const useFreshLogin = process.env.FRESH_LOGIN === 'true' || process.argv.includes('--fresh-login');
-    
-    await bot.login(useFreshLogin);
+    await bot.login();
 
     const moduleManager = new ModuleManager(bot);
     await moduleManager.loadModules();
@@ -738,9 +413,7 @@ async function main() {
     const messageHandler = new MessageHandler(bot, moduleManager, null);
     bot.onMessage((message) => messageHandler.handleMessage(message));
 
-    console.log('Bot is running with full module support and enhanced login capabilities.');
-    console.log('Features: Device fingerprint persistence, checkpoint auto-resolver, 2FA bypass');
-    console.log('Type .help for commands or use FRESH_LOGIN=true to force fresh login next time.');
+    console.log('Bot is running with full module support. Type .help for commands.');
 
     setInterval(() => {
       console.log(`[${new Date().toISOString()}] Bot heartbeat - Running: ${bot.isRunning}`);
