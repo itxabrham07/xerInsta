@@ -39,28 +39,14 @@ class InstagramBot {
    * Logs in to Instagram using session or cookies.
    * @throws {Error} If login fails due to missing credentials or invalid session/cookies.
    */
- async login() {
+  async login() {
     try {
       const username = config.instagram?.username;
-      const password = config.instagram?.password;
-      if (!username || !password) {
-        throw new Error('INSTAGRAM_USERNAME or INSTAGRAM_PASSWORD is missing');
+      if (!username) {
+        throw new Error('INSTAGRAM_USERNAME is missing');
       }
 
-      // ---- Load persisted device if exists ----
-      try {
-        const deviceState = JSON.parse(await fs.readFile('./device.json', 'utf-8'));
-        this.ig.state.deviceString = deviceState.deviceString;
-        this.ig.state.deviceId = deviceState.deviceId;
-        this.ig.state.uuid = deviceState.uuid;
-        this.ig.state.phoneId = deviceState.phoneId;
-        this.ig.state.adid = deviceState.adid;
-        this.log('INFO', 'Loaded device state from device.json ✅');
-      } catch {
-        this.ig.state.generateDevice(username);
-        this.log('INFO', 'Generated new device state');
-      }
-
+      this.ig.state.generateDevice(username); // Simulates mobile device
       let loginSuccess = false;
 
       // Attempt login with session
@@ -77,82 +63,22 @@ class InstagramBot {
       }
 
       // Fallback to cookies if session login fails
-     // ---- Fallback: Fresh login ----
-if (!loginSuccess) {
-  this.log('INFO', 'Attempting fresh login with username/password...');
-  await this.ig.simulate.preLoginFlow();
-  try {
-    const loggedInUser = await this.ig.account.login(username, password);
-    this.log('INFO', `Fresh login successful as @${loggedInUser.username} ✅`);
-    process.nextTick(async () => await this.ig.simulate.postLoginFlow());setTimeout(async () => {
-  this.log('INFO', 'Starting safe post-login setup...');
-
-  try {
-    // 1. Load reels tray (safe and useful)
-    await this.ig.feed.reelsTray().request();
-    this.log('DEBUG', '✅ Reels tray loaded');
-  } catch (error) {
-    this.log('DEBUG', 'Skipped reels tray:', error.message);
-  }
-
-  try {
-    // 2. Register push notifications (important for some MQTT features)
-    await this.ig.push.register();
-    this.log('DEBUG', '✅ Push registration complete');
-  } catch (error) {
-    this.log('DEBUG', 'Push registration failed (non-critical):', error.message);
-  }
-
-  try {
-    // 3. Mark app as active (simulates "seen" status)
-    await this.ig.directThread.broadcastVoiceMedia({ action: 'started' });
-    this.log('DEBUG', '✅ Voice broadcast init sent (presence hint)');
-  } catch (error) {
-    this.log('DEBUG', 'Voice broadcast init failed (non-critical):', error.message);
-  }
-
-  // Optional: warm up direct inbox
-  try {
-    await this.ig.feed.directInbox().items();
-    this.log('DEBUG', '✅ Direct inbox warmed up');
-  } catch (error) {
-    this.log('DEBUG', 'Inbox warm-up failed:', error.message);
-  }
-
-  this.log('INFO', 'Safe post-login setup completed');
-}, 1000);
-
-  } catch (err) {
-    if (err.name === 'IgChallengeError') {
-      this.log('WARN', 'Challenge required, handling automatically...');
-      await this.ig.challenge.auto(true); // auto select method
-      const code = await this.promptCode();
-      await this.ig.challenge.sendSecurityCode(code);
-      this.log('INFO', 'Challenge solved ✅');
-    } else {
-      throw err;
-    }
-  }
-
-  // ✅ Save only session + device (no cookies dump)
-  const session = await this.ig.state.serialize();
-  delete session.constants;
-  await fs.writeFile('./session.json', JSON.stringify(session, null, 2));
-  this.log('INFO', 'New session saved to session.json');
-
-  const deviceDump = {
-    deviceString: this.ig.state.deviceString,
-    deviceId: this.ig.state.deviceId,
-    uuid: this.ig.state.uuid,
-    phoneId: this.ig.state.phoneId,
-    adid: this.ig.state.adid,
-  };
-  await fs.writeFile('./device.json', JSON.stringify(deviceDump, null, 2));
-  this.log('INFO', 'Device state saved to device.json');
-
-  loginSuccess = true;
-}
-
+      if (!loginSuccess) {
+        try {
+          this.log('INFO', 'Attempting login using cookies.json...');
+          await this.loadCookiesFromJson('./cookies.json');
+          const user = await this.ig.account.currentUser();
+          this.log('INFO', `Logged in using cookies.json as @${user.username}`);
+          const session = await this.ig.state.serialize();
+          delete session.constants;
+          await fs.writeFile('./session.json', JSON.stringify(session, null, 2));
+          this.log('INFO', 'Session saved to session.json');
+          loginSuccess = true;
+        } catch (cookieError) {
+          this.log('ERROR', 'Failed to login with cookies:', cookieError.message);
+          throw new Error(`Cookie login failed: ${cookieError.message}`);
+        }
+      }
 
       if (!loginSuccess) {
         throw new Error('No valid login method succeeded');
