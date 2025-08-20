@@ -1,5 +1,3 @@
-fresh login ka option b dalo prestince device states k sath
-
 import { IgApiClient } from 'instagram-private-api';
 import { withRealtime } from 'instagram_mqtt';
 import { GraphQLSubscriptions, SkywalkerSubscriptions } from 'instagram_mqtt';
