@@ -43,8 +43,6 @@ class HyperInsta {
     this.instagramBot.onMessage((message) => messageHandler.handleMessage(message));
     console.log('✅ Message handler connected');
 
-    console.log(`🔔 Message request auto-approval: ${config.messageRequests?.autoApprove ? 'Enabled' : 'Disabled'}`);
-    console.log('✅ Bot is now LIVE and ready!');
     this.showLiveStatus();
 
   } catch (error) {
