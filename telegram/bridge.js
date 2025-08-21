@@ -236,23 +236,21 @@ class TelegramBridge {
 
     // Instagram to Telegram message forwarding
  
-    async sendToTelegram(message) {
+   async sendToTelegram(message) {
         if (!this.telegramBot || !this.enabled) return;
 
         try {
             const instagramThreadId = message.threadId;
             const senderUserId = message.senderId;
 
-            // Ensure user mapping exists
             if (!this.userMappings.has(senderUserId.toString())) {
-                 await this.saveUserMapping(senderUserId.toString(), {
+                await this.saveUserMapping(senderUserId.toString(), {
                     username: message.senderUsername,
-                    fullName: null, // Could potentially fetch this
+                    fullName: null,
                     firstSeen: new Date(),
                     messageCount: 0
                 });
             } else {
-                // Update message count
                 const userData = this.userMappings.get(senderUserId.toString());
                 userData.messageCount = (userData.messageCount || 0) + 1;
                 userData.lastSeen = new Date();
@@ -265,45 +263,43 @@ class TelegramBridge {
                 return;
             }
 
-            // Check filters (basic example)
             const textLower = (message.text || '').toLowerCase().trim();
             for (const word of this.filters) {
                 if (textLower.startsWith(word)) {
                     logger.info(`🛑 Blocked Instagram ➝ Telegram message due to filter "${word}": ${message.text}`);
-                    return; // Silently drop
+                    return;
                 }
             }
 
-            // Handle different message types
-            if (message.type === 'text') {
+            if (message.type === 'text' || !message.type) {
                 let messageText = message.text || '';
-                // Add sender info if needed (e.g., group context if available later)
-                // For now, assume DM context
-
+                if (!messageText.trim()) {
+                    messageText = '[Empty message]';
+                }
                 await this.sendSimpleMessage(topicId, messageText, instagramThreadId);
-            } else if (['media', 'photo', 'video', 'clip'].includes(message.type)) {
-                 // Handle media sent via Instagram API methods (broadcastPhoto, etc.)
-                 // This requires the raw message data to contain media info
-                 // This part is tricky without knowing the exact structure from ig_mqtt
-                 // We'll handle it in the handler for now, assuming it comes through
-                 // a different path or needs specific handling based on message.raw
-                 logger.warn(`⚠️ Media type '${message.type}' received, handling needs specific raw data access.`);
-                 // Placeholder for media handling logic if raw data is accessible
-                 await this.handleInstagramMedia(message, topicId);
-
+            } else if (['media', 'photo', 'video', 'clip', 'voice', 'raven_media'].includes(message.type)) {
+                await this.handleInstagramMedia(message, topicId);
+            } else if (message.type === 'voice_media') {
+                await this.handleInstagramVoice(message, topicId);
+            } else if (message.type === 'story_share') {
+                const storyText = `📖 Story shared${message.text ? `: ${message.text}` : ''}`;
+                await this.sendSimpleMessage(topicId, storyText, instagramThreadId);
+            } else if (message.type === 'link') {
+                const linkText = message.text || '[Link shared]';
+                await this.sendSimpleMessage(topicId, `🔗 ${linkText}`, instagramThreadId);
             } else {
-                 // Handle other types or fallback to text representation
-                 let fallbackText = `[Unsupported Message Type: ${message.type}]`;
-                 if (message.text) {
+                let fallbackText = `[${message.type || 'Unknown'} Message]`;
+                if (message.text) {
                     fallbackText += `\n${message.text}`;
-                 }
-                 await this.sendSimpleMessage(topicId, fallbackText, instagramThreadId);
+                }
+                await this.sendSimpleMessage(topicId, fallbackText, instagramThreadId);
             }
 
         } catch (error) {
             logger.error('❌ Error forwarding message to Telegram:', error.message);
         }
     }
+
 
     async sendSimpleMessage(topicId, text, instagramThreadId) {
         try {
