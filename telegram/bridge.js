@@ -235,6 +235,7 @@ class TelegramBridge {
     }
 
     // Instagram to Telegram message forwarding
+ 
     async sendToTelegram(message) {
         if (!this.telegramBot || !this.enabled) return;
 
@@ -244,13 +245,14 @@ class TelegramBridge {
 
             // Ensure user mapping exists
             if (!this.userMappings.has(senderUserId.toString())) {
-                await this.saveUserMapping(senderUserId.toString(), {
+                 await this.saveUserMapping(senderUserId.toString(), {
                     username: message.senderUsername,
-                    fullName: null,
+                    fullName: null, // Could potentially fetch this
                     firstSeen: new Date(),
                     messageCount: 0
                 });
             } else {
+                // Update message count
                 const userData = this.userMappings.get(senderUserId.toString());
                 userData.messageCount = (userData.messageCount || 0) + 1;
                 userData.lastSeen = new Date();
@@ -263,29 +265,39 @@ class TelegramBridge {
                 return;
             }
 
-            // Check filters
+            // Check filters (basic example)
             const textLower = (message.text || '').toLowerCase().trim();
             for (const word of this.filters) {
                 if (textLower.startsWith(word)) {
                     logger.info(`🛑 Blocked Instagram ➝ Telegram message due to filter "${word}": ${message.text}`);
-                    return;
+                    return; // Silently drop
                 }
             }
 
             // Handle different message types
             if (message.type === 'text') {
-                await this.sendSimpleMessage(topicId, message.text || '', instagramThreadId);
-            } else if (message.type === 'photo') {
-                await this.handleInstagramPhoto(message, topicId);
-            } else if (message.type === 'voice') {
-                await this.handleInstagramVoice(message, topicId);
+                let messageText = message.text || '';
+                // Add sender info if needed (e.g., group context if available later)
+                // For now, assume DM context
+
+                await this.sendSimpleMessage(topicId, messageText, instagramThreadId);
+            } else if (['media', 'photo', 'video', 'clip'].includes(message.type)) {
+                 // Handle media sent via Instagram API methods (broadcastPhoto, etc.)
+                 // This requires the raw message data to contain media info
+                 // This part is tricky without knowing the exact structure from ig_mqtt
+                 // We'll handle it in the handler for now, assuming it comes through
+                 // a different path or needs specific handling based on message.raw
+                 logger.warn(`⚠️ Media type '${message.type}' received, handling needs specific raw data access.`);
+                 // Placeholder for media handling logic if raw data is accessible
+                 await this.handleInstagramMedia(message, topicId);
+
             } else {
-                // Handle other types as text fallback
-                let fallbackText = `[Message Type: ${message.type}]`;
-                if (message.text) {
+                 // Handle other types or fallback to text representation
+                 let fallbackText = `[Unsupported Message Type: ${message.type}]`;
+                 if (message.text) {
                     fallbackText += `\n${message.text}`;
-                }
-                await this.sendSimpleMessage(topicId, fallbackText, instagramThreadId);
+                 }
+                 await this.sendSimpleMessage(topicId, fallbackText, instagramThreadId);
             }
 
         } catch (error) {
@@ -320,43 +332,93 @@ class TelegramBridge {
         }
     }
 
-    async handleInstagramPhoto(message, topicId) {
+      async handleInstagramMedia(message, topicId) {
         try {
-            // Handle photo from Instagram to Telegram
-            // This requires accessing the raw media data from the message
-            if (message.mediaUrl) {
-                await this.telegramBot.sendPhoto(this.telegramChatId, message.mediaUrl, {
-                    message_thread_id: topicId,
-                    caption: message.text || undefined
-                });
-                logger.info(`📸 Sent Instagram photo to Telegram topic ${topicId}`);
+            if (!message.raw) {
+                logger.warn("⚠️ No raw data available for Instagram media");
+                await this.sendSimpleMessage(topicId, `[Media: ${message.type}] ${message.text || 'No caption'}`, message.threadId);
+                return;
+            }
+
+            const raw = message.raw;
+            let mediaUrl = null;
+            let mediaType = 'photo';
+            let caption = message.text || '';
+
+            if (raw.media) {
+                if (raw.media.image_versions2?.candidates?.length > 0) {
+                    mediaUrl = raw.media.image_versions2.candidates[0].url;
+                    mediaType = 'photo';
+                } else if (raw.media.video_versions?.length > 0) {
+                    mediaUrl = raw.media.video_versions[0].url;
+                    mediaType = 'video';
+                }
+            } else if (raw.visual_media?.media) {
+                const media = raw.visual_media.media;
+                if (media.image_versions2?.candidates?.length > 0) {
+                    mediaUrl = media.image_versions2.candidates[0].url;
+                    mediaType = 'photo';
+                } else if (media.video_versions?.length > 0) {
+                    mediaUrl = media.video_versions[0].url;
+                    mediaType = 'video';
+                }
+            }
+
+            if (mediaUrl) {
+                if (mediaType === 'photo') {
+                    await this.telegramBot.sendPhoto(this.telegramChatId, mediaUrl, {
+                        message_thread_id: topicId,
+                        caption: caption || undefined
+                    });
+                } else if (mediaType === 'video') {
+                    await this.telegramBot.sendVideo(this.telegramChatId, mediaUrl, {
+                        message_thread_id: topicId,
+                        caption: caption || undefined
+                    });
+                }
+                logger.info(`📸 ✅ Sent Instagram ${mediaType} to Telegram topic ${topicId}`);
             } else {
-                await this.sendSimpleMessage(topicId, `[Photo] ${message.text || 'No caption'}`, message.threadId);
+                await this.sendSimpleMessage(topicId, `[Media: ${message.type}] ${caption}`, message.threadId);
             }
         } catch (error) {
-            logger.error('❌ Error handling Instagram photo:', error.message);
-            await this.sendSimpleMessage(topicId, `[Photo - Error] ${message.text || 'No caption'}`, message.threadId);
+            logger.error("❌ Error handling Instagram media:", error.message);
+            await this.sendSimpleMessage(topicId, `[Media: ${message.type}] ${message.text || 'No caption'}`, message.threadId);
         }
     }
+
 
     async handleInstagramVoice(message, topicId) {
         try {
-            // Handle voice message from Instagram to Telegram
-            if (message.mediaUrl) {
-                await this.telegramBot.sendVoice(this.telegramChatId, message.mediaUrl, {
-                    message_thread_id: topicId,
-                    caption: message.text || undefined
-                });
-                logger.info(`🎤 Sent Instagram voice message to Telegram topic ${topicId}`);
+            if (!message.raw || !message.raw.voice_media) {
+                logger.warn("⚠️ No voice media data available");
+                await this.sendSimpleMessage(topicId, `🎤 Voice message received`, message.threadId);
+                return;
+            }
+
+            const voiceMedia = message.raw.voice_media.media;
+            if (voiceMedia && voiceMedia.audio && voiceMedia.audio.audio_src) {
+                const audioUrl = voiceMedia.audio.audio_src;
+                const duration = voiceMedia.audio.duration || 0;
+                
+                try {
+                    await this.telegramBot.sendVoice(this.telegramChatId, audioUrl, {
+                        message_thread_id: topicId,
+                        duration: duration,
+                        caption: message.text || undefined
+                    });
+                    logger.info(`🎤 ✅ Sent Instagram voice message to Telegram topic ${topicId}`);
+                } catch (voiceError) {
+                    logger.error(`❌ Failed to send voice to Telegram: ${voiceError.message}`);
+                    await this.sendSimpleMessage(topicId, `🎤 Voice message (${duration}s)${message.text ? `: ${message.text}` : ''}`, message.threadId);
+                }
             } else {
-                await this.sendSimpleMessage(topicId, `[Voice Message] ${message.text || 'No caption'}`, message.threadId);
+                await this.sendSimpleMessage(topicId, `🎤 Voice message received`, message.threadId);
             }
         } catch (error) {
-            logger.error('❌ Error handling Instagram voice:', error.message);
-            await this.sendSimpleMessage(topicId, `[Voice Message - Error] ${message.text || 'No caption'}`, message.threadId);
+            logger.error("❌ Error handling Instagram voice:", error.message);
+            await this.sendSimpleMessage(topicId, `🎤 Voice message received`, message.threadId);
         }
     }
-
     // Telegram to Instagram handlers
     async setupTelegramHandlers() {
         if (!this.telegramBot) return;
