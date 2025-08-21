@@ -7,52 +7,58 @@ import { config } from '../config.js';
 import { logger } from '../utils/utils.js';
 
 class TelegramBridge {
-    constructor() {
-        this.instagramBot = null;
-        this.telegramBot = null;
-        this.chatMappings = new Map(); // instagramThreadId -> telegramTopicId
-        this.userMappings = new Map(); // instagramUserId -> { username, fullName, firstSeen, messageCount }
-        this.tempDir = path.join(process.cwd(), 'temp');
-        this.db = null;
-        this.collection = null;
-        this.telegramChatId = null;
-        this.creatingTopics = new Map(); // instagramThreadId => Promise
-        this.topicVerificationCache = new Map(); // instagramThreadId => boolean (exists)
-        this.enabled = false;
-        this.filters = new Set();
-    }
+constructor() {
+    this.instagramBot = null;
+    this.telegramBot = null;
+    this.botId = null; 
+    this.chatMappings = new Map();
+    this.userMappings = new Map();
+    this.tempDir = path.join(process.cwd(), 'temp');
+    this.db = null;
+    this.collection = null;
+    this.telegramChatId = null;
+    this.creatingTopics = new Map();
+    this.topicVerificationCache = new Map();
+    this.enabled = false;
+    this.filters = new Set();
+}
 
     async initialize(instagramBotInstance) {
-        this.instagramBot = instagramBotInstance;
+    this.instagramBot = instagramBotInstance;
 
-        const token = config.telegram?.botToken;
-        this.telegramChatId = config.telegram?.chatId;
+    const token = config.telegram?.botToken;
+    this.telegramChatId = config.telegram?.chatId;
 
-        if (!token || token.includes('YOUR_BOT_TOKEN') || !this.telegramChatId || this.telegramChatId.includes('YOUR_CHAT_ID')) {
-            logger.warn('⚠️ Telegram bot token or chat ID not configured for Instagram bridge');
-            return;
-        }
-
-        try {
-            await this.initializeDatabase();
-            await fs.ensureDir(this.tempDir);
-            this.telegramBot = new TelegramBot(token, {
-                polling: true
-            });
-
-            await this.setupTelegramHandlers();
-            await this.loadMappingsFromDb();
-            await this.loadFiltersFromDb();
-
-            this.setupInstagramHandlers();
-
-            this.enabled = true;
-            logger.info('✅ Instagram-Telegram bridge initialized');
-        } catch (error) {
-            logger.error('❌ Failed to initialize Instagram-Telegram bridge:', error.message);
-            this.enabled = false;
-        }
+    if (!token || token.includes('YOUR_BOT_TOKEN') || !this.telegramChatId || this.telegramChatId.includes('YOUR_CHAT_ID')) {
+        logger.warn('⚠️ Telegram bot token or chat ID not configured for Instagram bridge');
+        return;
     }
+
+    try {
+        await this.initializeDatabase();
+        await fs.ensureDir(this.tempDir);
+        this.telegramBot = new TelegramBot(token, {
+            polling: true
+        });
+
+        // Fetch bot's own ID
+        const botInfo = await this.telegramBot.getMe();
+        this.botId = botInfo.id; // Store bot's ID
+        logger.info(`✅ Telegram bot ID: ${this.botId}`);
+
+        await this.setupTelegramHandlers();
+        await this.loadMappingsFromDb();
+        await this.loadFiltersFromDb();
+
+        this.setupInstagramHandlers();
+
+        this.enabled = true;
+        logger.info('✅ Instagram-Telegram bridge initialized');
+    } catch (error) {
+        logger.error('❌ Failed to initialize Instagram-Telegram bridge:', error.message);
+        this.enabled = false;
+    }
+}
 
     async initializeDatabase() {
         try {
@@ -425,46 +431,52 @@ async handleInstagramVoice(message, topicId) {
     }
 
     async handleTelegramMessage(msg) {
-        try {
-            const topicId = msg.message_thread_id;
-            const instagramThreadId = this.findInstagramThreadIdByTopic(topicId);
+    try {
+        // Ignore messages sent by the bot itself
+        if (msg.from.id === this.botId) {
+            logger.debug(`ℹ️ Ignoring message from bot itself (ID: ${msg.from.id})`);
+            return;
+        }
 
-            if (!instagramThreadId) {
-                logger.warn('⚠️ Could not find Instagram thread for Telegram message');
-                await this.setReaction(msg.chat.id, msg.message_id, '❓');
+        const topicId = msg.message_thread_id;
+        const instagramThreadId = this.findInstagramThreadIdByTopic(topicId);
+
+        if (!instagramThreadId) {
+            logger.warn('⚠️ Could not find Instagram thread for Telegram message');
+            await this.setReaction(msg.chat.id, msg.message_id, '❓');
+            return;
+        }
+
+        // Filter check
+        const originalText = msg.text?.trim() || '';
+        const textLower = originalText.toLowerCase();
+        for (const word of this.filters) {
+            if (textLower.startsWith(word)) {
+                logger.info(`🛑 Blocked Telegram ➝ Instagram message due to filter "${word}": ${originalText}`);
+                await this.setReaction(msg.chat.id, msg.message_id, '🚫');
                 return;
             }
+        }
 
-            // Filter check
-            const originalText = msg.text?.trim() || '';
-            const textLower = originalText.toLowerCase();
-            for (const word of this.filters) {
-                if (textLower.startsWith(word)) {
-                    logger.info(`🛑 Blocked Telegram ➝ Instagram message due to filter "${word}": ${originalText}`);
-                    await this.setReaction(msg.chat.id, msg.message_id, '🚫');
-                    return;
-                }
-            }
-
-            // Only handle text messages from Telegram to Instagram
-            if (msg.text) {
-                const sendResult = await this.instagramBot.sendMessage(instagramThreadId, originalText);
-                if (sendResult) {
-                    await this.setReaction(msg.chat.id, msg.message_id, '👍');
-                } else {
-                    throw new Error('Instagram send failed');
-                }
+        // Only handle text messages from Telegram to Instagram
+        if (msg.text) {
+            const sendResult = await this.instagramBot.sendMessage(instagramThreadId, originalText);
+            if (sendResult) {
+                await this.setReaction(msg.chat.id, msg.message_id, '👍');
             } else {
-                // For non-text messages, inform user that only text is supported
-                logger.warn(`⚠️ Non-text message received in topic ${topicId}, only text messages are supported from Telegram to Instagram`);
-                await this.setReaction(msg.chat.id, msg.message_id, '❌');
+                throw new Error('Instagram send failed');
             }
-
-        } catch (error) {
-            logger.error('❌ Failed to handle Telegram message:', error.message);
+        } else {
+            // For non-text messages, inform user that only text is supported
+            logger.warn(`⚠️ Non-text message received in topic ${topicId}, only text messages are supported from Telegram to Instagram`);
             await this.setReaction(msg.chat.id, msg.message_id, '❌');
         }
+
+    } catch (error) {
+        logger.error('❌ Failed to handle Telegram message:', error.message);
+        await this.setReaction(msg.chat.id, msg.message_id, '❌');
     }
+}
 
     async setReaction(chatId, messageId, emoji) {
         try {
