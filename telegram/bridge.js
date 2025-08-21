@@ -1,9 +1,3 @@
-# Telegram Bridge - Text Only Version
-
-Here's the complete code with all requested modifications:
-
-```javascript
-// telegram/bridge.js - Text Only Version
 import TelegramBot from 'node-telegram-bot-api';
 import fs from 'fs-extra';
 import path from 'path';
