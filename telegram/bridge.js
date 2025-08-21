@@ -235,7 +235,7 @@ class TelegramBridge {
     }
 
     // Instagram to Telegram message forwarding
- async sendToTelegram(message) {
+async sendToTelegram(message) {
     if (!this.telegramBot || !this.enabled) return;
 
     try {
@@ -266,7 +266,7 @@ class TelegramBridge {
 
         // Filter messages based on content
         const textLower = (message.text || '').toLowerCase().trim();
-        for (-const word of this.filters) {
+        for (const word of this.filters) { // Corrected syntax: removed erroneous "-"
             if (textLower.startsWith(word)) {
                 logger.info(`🛑 Blocked Instagram ➝ Telegram message due to filter "${word}": ${message.text}`);
                 return;
@@ -327,66 +327,66 @@ async handleInstagramPhoto(message, topicId) {
     }
 }
 
-    async sendSimpleMessage(topicId, text, instagramThreadId) {
-        try {
-            const exists = await this.verifyTopicExists(topicId);
-            if (!exists) {
-                logger.warn(`🗑️ Topic ${topicId} for Instagram thread ${instagramThreadId} seems deleted. Recreating...`);
-                this.chatMappings.delete(instagramThreadId);
-                await this.collection.deleteOne({ type: 'chat', 'data.instagramThreadId': instagramThreadId });
-                return null;
-            }
-
-            const sentMessage = await this.telegramBot.sendMessage(this.telegramChatId, text, {
-                message_thread_id: topicId
-            });
-            return sentMessage.message_id;
-        } catch (error) {
-            const desc = error.response?.body?.description || error.message;
-            if (desc.includes('message thread not found') || desc.includes('Bad Request: group chat was deactivated')) {
-                logger.warn(`🗑️ Topic ID ${topicId} for Instagram thread ${instagramThreadId} is missing. Marking for recreation.`);
-                this.chatMappings.delete(instagramThreadId);
-                await this.collection.deleteOne({ type: 'chat', 'data.instagramThreadId': instagramThreadId });
-            } else {
-                logger.error('❌ Failed to send message to Telegram:', desc);
-            }
+async sendSimpleMessage(topicId, text, instagramThreadId) {
+    try {
+        const exists = await this.verifyTopicExists(topicId);
+        if (!exists) {
+            logger.warn(`🗑️ Topic ${topicId} for Instagram thread ${instagramThreadId} seems deleted. Recreating...`);
+            this.chatMappings.delete(instagramThreadId);
+            await this.collection.deleteOne({ type: 'chat', 'data.instagramThreadId': instagramThreadId });
             return null;
         }
+
+        const sentMessage = await this.telegramBot.sendMessage(this.telegramChatId, text, {
+            message_thread_id: topicId
+        });
+        return sentMessage.message_id;
+    } catch (error) {
+        const desc = error.response?.body?.description || error.message;
+        if (desc.includes('message thread not found') || desc.includes('Bad Request: group chat was deactivated')) {
+            logger.warn(`🗑️ Topic ID ${topicId} for Instagram thread ${instagramThreadId} is missing. Marking for recreation.`);
+            this.chatMappings.delete(instagramThreadId);
+            await this.collection.deleteOne({ type: 'chat', 'data.instagramThreadId': instagramThreadId });
+        } else {
+            logger.error('❌ Failed to send message to Telegram:', desc);
+        }
+        return null;
     }
+}
 
-     
-    async handleInstagramVoice(message, topicId) {
-        try {
-            if (!message.raw || !message.raw.voice_media) {
-                logger.warn("⚠️ No voice media data available");
-                await this.sendSimpleMessage(topicId, `🎤 Voice message received`, message.threadId);
-                return;
-            }
+async handleInstagramVoice(message, topicId) {
+    try {
+        if (!message.raw || !message.raw.voice_media) {
+            logger.warn("⚠️ No voice media data available");
+            await this.sendSimpleMessage(topicId, `🎤 Voice message received`, message.threadId);
+            return;
+        }
 
-            const voiceMedia = message.raw.voice_media.media;
-            if (voiceMedia && voiceMedia.audio && voiceMedia.audio.audio_src) {
-                const audioUrl = voiceMedia.audio.audio_src;
-                const duration = voiceMedia.audio.duration || 0;
-                
-                try {
-                    await this.telegramBot.sendVoice(this.telegramChatId, audioUrl, {
-                        message_thread_id: topicId,
-                        duration: duration,
-                        caption: message.text || undefined
-                    });
-                    logger.info(`🎤 ✅ Sent Instagram voice message to Telegram topic ${topicId}`);
-                } catch (voiceError) {
-                    logger.error(`❌ Failed to send voice to Telegram: ${voiceError.message}`);
-                    await this.sendSimpleMessage(topicId, `🎤 Voice message (${duration}s)${message.text ? `: ${message.text}` : ''}`, message.threadId);
-                }
-            } else {
-                await this.sendSimpleMessage(topicId, `🎤 Voice message received`, message.threadId);
+        const voiceMedia = message.raw.voice_media.media;
+        if (voiceMedia && voiceMedia.audio && voiceMedia.audio.audio_src) {
+            const audioUrl = voiceMedia.audio.audio_src;
+            const duration = voiceMedia.audio.duration || 0;
+            
+            try {
+                await this.telegramBot.sendVoice(this.telegramChatId, audioUrl, {
+                    message_thread_id: topicId,
+                    duration: duration,
+                    caption: message.text || undefined
+                });
+                logger.info(`🎤 ✅ Sent Instagram voice message to Telegram topic ${topicId}`);
+            } catch (voiceError) {
+                logger.error(`❌ Failed to send voice to Telegram: ${voiceError.message}`);
+                await this.sendSimpleMessage(topicId, `🎤 Voice message (${duration}s)${message.text ? `: ${message.text}` : ''}`, message.threadId);
             }
-        } catch (error) {
-            logger.error("❌ Error handling Instagram voice:", error.message);
+        } else {
             await this.sendSimpleMessage(topicId, `🎤 Voice message received`, message.threadId);
         }
+    } catch (error) {
+        logger.error("❌ Error handling Instagram voice:", error.message);
+        await this.sendSimpleMessage(topicId, `🎤 Voice message received`, message.threadId);
     }
+}
+//////////////////
     // Telegram to Instagram handlers
     async setupTelegramHandlers() {
         if (!this.telegramBot) return;
