@@ -11,6 +11,7 @@ class TelegramBridge {
         this.instagramBot = null;
         this.telegramBot = null;
         this.chatMappings = new Map();
+        this.userMappings = new Map();
         this.tempDir = path.join(process.cwd(), 'temp');
         this.db = null;
         this.collection = null;
@@ -19,7 +20,7 @@ class TelegramBridge {
         this.topicVerificationCache = new Map();
         this.enabled = false;
         this.filters = new Set();
-        this.botId = null;
+        this.botId = null; // To store the bot's own ID
     }
 
     async initialize(instagramBotInstance) {
@@ -45,6 +46,7 @@ class TelegramBridge {
                 polling: true,
             });
 
+            // Get the bot's own ID
             const botInfo = await this.telegramBot.getMe();
             this.botId = botInfo.id;
             logger.info(`🤖 Telegram bot ID: ${this.botId}`);
@@ -69,6 +71,7 @@ class TelegramBridge {
             logger.info('✅ MongoDB connection successful');
             this.collection = this.db.collection('bridge');
             await this.collection.createIndex({ type: 1, 'data.instagramThreadId': 1 }, { unique: true, partialFilterExpression: { type: 'chat' } });
+            await this.collection.createIndex({ type: 1, 'data.instagramUserId': 1 }, { unique: true, partialFilterExpression: { type: 'user' } });
             logger.info('📊 Database initialized');
         } catch (error) {
             logger.error('❌ Failed to initialize database:', error.message);
@@ -82,13 +85,25 @@ class TelegramBridge {
             return;
         }
         try {
-            const mappings = await this.collection.find({ type: 'chat' }).toArray();
+            const mappings = await this.collection.find({}).toArray();
             for (const mapping of mappings) {
-                this.chatMappings.set(mapping.data.instagramThreadId, mapping.data.telegramTopicId);
+                switch (mapping.type) {
+                    case 'chat':
+                        this.chatMappings.set(mapping.data.instagramThreadId, mapping.data.telegramTopicId);
+                        break;
+                    case 'user':
+                        this.userMappings.set(mapping.data.instagramUserId, {
+                            username: mapping.data.username,
+                            fullName: mapping.data.fullName,
+                            firstSeen: mapping.data.firstSeen,
+                            messageCount: mapping.data.messageCount || 0
+                        });
+                        break;
+                }
             }
-            logger.info(`📊 Loaded ${this.chatMappings.size} chat mappings`);
+            logger.info(`📊 Loaded mappings: ${this.chatMappings.size} chats, ${this.userMappings.size} users`);
         } catch (error) {
-            logger.error('❌ Failed to load chat mappings:', error.message);
+            logger.error('❌ Failed to load mappings:', error.message);
         }
     }
 
@@ -115,6 +130,33 @@ class TelegramBridge {
             logger.debug(`✅ Saved chat mapping: ${instagramThreadId} -> ${telegramTopicId}`);
         } catch (error) {
             logger.error('❌ Failed to save chat mapping:', error.message);
+        }
+    }
+
+    async saveUserMapping(instagramUserId, userData) {
+        if (!this.collection) return;
+        try {
+            await this.collection.updateOne(
+                { type: 'user', 'data.instagramUserId': instagramUserId },
+                {
+                    $set: {
+                        type: 'user',
+                        data: {
+                            instagramUserId,
+                            username: userData.username,
+                            fullName: userData.fullName,
+                            firstSeen: userData.firstSeen,
+                            messageCount: userData.messageCount || 0,
+                            lastSeen: new Date()
+                        }
+                    }
+                },
+                { upsert: true }
+            );
+            this.userMappings.set(instagramUserId, userData);
+            logger.debug(`✅ Saved user mapping: ${instagramUserId} (@${userData.username || 'unknown'})`);
+        } catch (error) {
+            logger.error('❌ Failed to save user mapping:', error.message);
         }
     }
 
@@ -149,8 +191,21 @@ class TelegramBridge {
             }
 
             try {
-                const topicName = senderUserId ? `User ${senderUserId}` : `Instagram Chat ${instagramThreadId.substring(0, 10)}...`;
-                const iconColor = 0x7ABA3C;
+                let topicName = `Instagram Chat ${instagramThreadId.substring(0, 10)}...`;
+                let iconColor = 0x7ABA3C;
+
+                const userInfo = this.userMappings.get(senderUserId?.toString());
+                if (userInfo) {
+                    topicName = `@${userInfo.username || userInfo.fullName || senderUserId}`;
+                } else if (senderUserId) {
+                    topicName = `User ${senderUserId}`;
+                    await this.saveUserMapping(senderUserId.toString(), {
+                        username: null,
+                        fullName: null,
+                        firstSeen: new Date(),
+                        messageCount: 0
+                    });
+                }
 
                 const topic = await this.telegramBot.createForumTopic(this.telegramChatId, topicName, {
                     icon_color: iconColor
@@ -195,6 +250,20 @@ class TelegramBridge {
         try {
             const instagramThreadId = message.threadId;
             const senderUserId = message.senderId;
+
+            if (!this.userMappings.has(senderUserId.toString())) {
+                await this.saveUserMapping(senderUserId.toString(), {
+                    username: message.senderUsername,
+                    fullName: null,
+                    firstSeen: new Date(),
+                    messageCount: 0
+                });
+            } else {
+                const userData = this.userMappings.get(senderUserId.toString());
+                userData.messageCount = (userData.messageCount || 0) + 1;
+                userData.lastSeen = new Date();
+                await this.saveUserMapping(senderUserId.toString(), userData);
+            }
 
             const topicId = await this.getOrCreateTopic(instagramThreadId, senderUserId);
             if (!topicId) {
@@ -366,6 +435,7 @@ class TelegramBridge {
                 return;
             }
 
+            // Ignore messages sent by the bot itself
             if (msg.from.id === this.botId) {
                 logger.debug(`🚫 Ignored message from bot itself (ID: ${msg.from.id})`);
                 return;
