@@ -235,71 +235,97 @@ class TelegramBridge {
     }
 
     // Instagram to Telegram message forwarding
- 
-   async sendToTelegram(message) {
-        if (!this.telegramBot || !this.enabled) return;
+ async sendToTelegram(message) {
+    if (!this.telegramBot || !this.enabled) return;
 
-        try {
-            const instagramThreadId = message.threadId;
-            const senderUserId = message.senderId;
+    try {
+        const instagramThreadId = message.threadId;
+        const senderUserId = message.senderId;
 
-            if (!this.userMappings.has(senderUserId.toString())) {
-                await this.saveUserMapping(senderUserId.toString(), {
-                    username: message.senderUsername,
-                    fullName: null,
-                    firstSeen: new Date(),
-                    messageCount: 0
-                });
-            } else {
-                const userData = this.userMappings.get(senderUserId.toString());
-                userData.messageCount = (userData.messageCount || 0) + 1;
-                userData.lastSeen = new Date();
-                await this.saveUserMapping(senderUserId.toString(), userData);
-            }
+        // Handle user mapping
+        if (!this.userMappings.has(senderUserId.toString())) {
+            await this.saveUserMapping(senderUserId.toString(), {
+                username: message.senderUsername,
+                fullName: null,
+                firstSeen: new Date(),
+                messageCount: 0
+            });
+        } else {
+            const userData = this.userMappings.get(senderUserId.toString());
+            userData.messageCount = (userData.messageCount || 0) + 1;
+            userData.lastSeen = new Date();
+            await this.saveUserMapping(senderUserId.toString(), userData);
+        }
 
-            const topicId = await this.getOrCreateTopic(instagramThreadId, senderUserId);
-            if (!topicId) {
-                logger.error(`❌ Could not get/create Telegram topic for Instagram thread ${instagramThreadId}`);
+        // Get or create Telegram topic
+        const topicId = await this.getOrCreateTopic(instagramThreadId, senderUserId);
+        if (!topicId) {
+            logger.error(`❌ Could not get/create Telegram topic for Instagram thread ${instagramThreadId}`);
+            return;
+        }
+
+        // Filter messages based on content
+        const textLower = (message.text || '').toLowerCase().trim();
+        for (-const word of this.filters) {
+            if (textLower.startsWith(word)) {
+                logger.info(`🛑 Blocked Instagram ➝ Telegram message due to filter "${word}": ${message.text}`);
                 return;
             }
-
-            const textLower = (message.text || '').toLowerCase().trim();
-            for (const word of this.filters) {
-                if (textLower.startsWith(word)) {
-                    logger.info(`🛑 Blocked Instagram ➝ Telegram message due to filter "${word}": ${message.text}`);
-                    return;
-                }
-            }
-
-            if (message.type === 'text' || !message.type) {
-                let messageText = message.text || '';
-                if (!messageText.trim()) {
-                    messageText = '[Empty message]';
-                }
-                await this.sendSimpleMessage(topicId, messageText, instagramThreadId);
-            } else if (['media', 'photo', 'video', 'clip', 'voice', 'raven_media'].includes(message.type)) {
-                await this.handleInstagramMedia(message, topicId);
-            } else if (message.type === 'voice_media') {
-                await this.handleInstagramVoice(message, topicId);
-            } else if (message.type === 'story_share') {
-                const storyText = `📖 Story shared${message.text ? `: ${message.text}` : ''}`;
-                await this.sendSimpleMessage(topicId, storyText, instagramThreadId);
-            } else if (message.type === 'link') {
-                const linkText = message.text || '[Link shared]';
-                await this.sendSimpleMessage(topicId, `🔗 ${linkText}`, instagramThreadId);
-            } else {
-                let fallbackText = `[${message.type || 'Unknown'} Message]`;
-                if (message.text) {
-                    fallbackText += `\n${message.text}`;
-                }
-                await this.sendSimpleMessage(topicId, fallbackText, instagramThreadId);
-            }
-
-        } catch (error) {
-            logger.error('❌ Error forwarding message to Telegram:', error.message);
         }
-    }
 
+        // Handle text, voice, and photo messages
+        if (message.type === 'text' || !message.type) {
+            let messageText = message.text || '';
+            if (!messageText.trim()) {
+                messageText = '[Empty message]';
+            }
+            await this.sendSimpleMessage(topicId, messageText, instagramThreadId);
+        } else if (message.type === 'voice_media') {
+            await this.handleInstagramVoice(message, topicId);
+        } else if (['media', 'photo', 'raven_media'].includes(message.type)) {
+            await this.handleInstagramPhoto(message, topicId);
+        } else {
+            logger.info(`🛑 Ignored unsupported message type: ${message.type}`);
+            return;
+        }
+
+    } catch (error) {
+        logger.error('❌ Error forwarding message to Telegram:', error.message);
+    }
+}
+
+async handleInstagramPhoto(message, topicId) {
+    try {
+        if (!message.raw) {
+            logger.warn("⚠️ No raw data available for Instagram photo");
+            await this.sendSimpleMessage(topicId, `[Photo] ${message.text || 'No caption'}`, message.threadId);
+            return;
+        }
+
+        const raw = message.raw;
+        let mediaUrl = null;
+        let caption = message.text || '';
+
+        if (raw.media?.image_versions2?.candidates?.length > 0) {
+            mediaUrl = raw.media.image_versions2.candidates[0].url;
+        } else if (raw.visual_media?.media?.image_versions2?.candidates?.length > 0) {
+            mediaUrl = raw.visual_media.media.image_versions2.candidates[0].url;
+        }
+
+        if (mediaUrl) {
+            await this.telegramBot.sendPhoto(this.telegramChatId, mediaUrl, {
+                message_thread_id: topicId,
+                caption: caption || undefined
+            });
+            logger.info(`📸 ✅ Sent Instagram photo to Telegram topic ${topicId}`);
+        } else {
+            await this.sendSimpleMessage(topicId, `[Photo] ${caption || 'No caption'}`, message.threadId);
+        }
+    } catch (error) {
+        logger.error("❌ Error handling Instagram photo:", error.message);
+        await this.sendSimpleMessage(topicId, `[Photo] ${message.text || 'No caption'}`, message.threadId);
+    }
+}
 
     async sendSimpleMessage(topicId, text, instagramThreadId) {
         try {
@@ -328,61 +354,7 @@ class TelegramBridge {
         }
     }
 
-      async handleInstagramMedia(message, topicId) {
-        try {
-            if (!message.raw) {
-                logger.warn("⚠️ No raw data available for Instagram media");
-                await this.sendSimpleMessage(topicId, `[Media: ${message.type}] ${message.text || 'No caption'}`, message.threadId);
-                return;
-            }
-
-            const raw = message.raw;
-            let mediaUrl = null;
-            let mediaType = 'photo';
-            let caption = message.text || '';
-
-            if (raw.media) {
-                if (raw.media.image_versions2?.candidates?.length > 0) {
-                    mediaUrl = raw.media.image_versions2.candidates[0].url;
-                    mediaType = 'photo';
-                } else if (raw.media.video_versions?.length > 0) {
-                    mediaUrl = raw.media.video_versions[0].url;
-                    mediaType = 'video';
-                }
-            } else if (raw.visual_media?.media) {
-                const media = raw.visual_media.media;
-                if (media.image_versions2?.candidates?.length > 0) {
-                    mediaUrl = media.image_versions2.candidates[0].url;
-                    mediaType = 'photo';
-                } else if (media.video_versions?.length > 0) {
-                    mediaUrl = media.video_versions[0].url;
-                    mediaType = 'video';
-                }
-            }
-
-            if (mediaUrl) {
-                if (mediaType === 'photo') {
-                    await this.telegramBot.sendPhoto(this.telegramChatId, mediaUrl, {
-                        message_thread_id: topicId,
-                        caption: caption || undefined
-                    });
-                } else if (mediaType === 'video') {
-                    await this.telegramBot.sendVideo(this.telegramChatId, mediaUrl, {
-                        message_thread_id: topicId,
-                        caption: caption || undefined
-                    });
-                }
-                logger.info(`📸 ✅ Sent Instagram ${mediaType} to Telegram topic ${topicId}`);
-            } else {
-                await this.sendSimpleMessage(topicId, `[Media: ${message.type}] ${caption}`, message.threadId);
-            }
-        } catch (error) {
-            logger.error("❌ Error handling Instagram media:", error.message);
-            await this.sendSimpleMessage(topicId, `[Media: ${message.type}] ${message.text || 'No caption'}`, message.threadId);
-        }
-    }
-
-
+     
     async handleInstagramVoice(message, topicId) {
         try {
             if (!message.raw || !message.raw.voice_media) {
