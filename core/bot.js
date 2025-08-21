@@ -403,47 +403,24 @@ class InstagramBot {
  */
 async function main() {
   let bot;
-  let telegramBridge; // Add this
-  
   try {
     bot = new InstagramBot();
     await bot.login();
-
-    // Initialize Telegram Bridge - Add this block
-    telegramBridge = new TelegramBridge();
-    await telegramBridge.initialize(bot);
 
     const moduleManager = new ModuleManager(bot);
     await moduleManager.loadModules();
 
     const messageHandler = new MessageHandler(bot, moduleManager, null);
-    
-    // Register BOTH handlers - Modify this part
-    bot.onMessage(async (message) => {
-      try {
-        // 1. Forward to Telegram first
-        if (telegramBridge && telegramBridge.enabled) {
-          await telegramBridge.sendToTelegram(message);
-        }
-        
-        // 2. Then handle bot commands/responses
-        await messageHandler.handleMessage(message);
-      } catch (error) {
-        console.error('Error processing message:', error.message);
-      }
-    });
+    bot.onMessage((message) => messageHandler.handleMessage(message));
 
-    console.log('Bot is running with Telegram bridge and module support. Type .help for commands.');
+    console.log('Bot is running with full module support. Type .help for commands.');
 
     setInterval(() => {
-      console.log(`[${new Date().toISOString()}] Bot heartbeat - Running: ${bot.isRunning}, Bridge: ${telegramBridge?.enabled || false}`);
+      console.log(`[${new Date().toISOString()}] Bot heartbeat - Running: ${bot.isRunning}`);
     }, 300000);
 
     const shutdownHandler = async () => {
       console.log('\n[SIGINT/SIGTERM] Shutting down gracefully...');
-      if (telegramBridge) {
-        await telegramBridge.shutdown(); // Add this
-      }
       if (bot) await bot.disconnect();
       console.log('Shutdown complete.');
       process.exit(0);
@@ -453,11 +430,11 @@ async function main() {
     process.on('SIGTERM', shutdownHandler);
   } catch (error) {
     console.error('Bot failed to start:', error.message);
-    if (telegramBridge) await telegramBridge.shutdown(); // Add this
     if (bot) await bot.disconnect();
     process.exit(1);
   }
 }
+
 if (import.meta.url === `file://${process.argv[1]}`) {
   main().catch((error) => {
     console.error('Unhandled error in main:', error.message);
