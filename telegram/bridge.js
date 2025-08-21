@@ -168,63 +168,67 @@ class TelegramBridge {
     }
 
     // --- Topic Management ---
-    async getOrCreateTopic(instagramThreadId, senderUserId) {
-        if (this.chatMappings.has(instagramThreadId)) {
-            return this.chatMappings.get(instagramThreadId);
+  async getOrCreateTopic(instagramThreadId, senderUserId) {
+    // First check if we have a mapping AND if the topic still exists
+    if (this.chatMappings.has(instagramThreadId)) {
+        const topicId = this.chatMappings.get(instagramThreadId);
+        const exists = await this.verifyTopicExists(topicId);
+        if (exists) {
+            return topicId;
         }
-        if (this.creatingTopics.has(instagramThreadId)) {
-            logger.debug(`⏳ Topic creation for ${instagramThreadId} already in progress, waiting...`);
-            return await this.creatingTopics.get(instagramThreadId);
-        }
-        const creationPromise = (async () => {
-            if (!this.telegramChatId) {
-                logger.error('❌ Telegram chat ID not configured');
-                return null;
-            }
-            try {
-                let topicName = `Instagram Chat ${instagramThreadId.substring(0, 10)}...`;
-                let iconColor = 0x7ABA3C;
-                const userInfo = this.userMappings.get(senderUserId?.toString());
-                if (userInfo) {
-                    topicName = `@${userInfo.username || userInfo.fullName || senderUserId}`;
-                } else if (senderUserId) {
-                    topicName = `User ${senderUserId}`;
-                    await this.saveUserMapping(senderUserId.toString(), {
-                        username: null,
-                        fullName: null,
-                        firstSeen: new Date(),
-                        messageCount: 0
-                    });
-                }
-                const topic = await this.telegramBot.createForumTopic(this.telegramChatId, topicName, {
-                    icon_color: iconColor
-                });
-                await this.saveChatMapping(instagramThreadId, topic.message_thread_id);
-                logger.info(`🆕 Created Telegram topic: "${topicName}" (ID: ${topic.message_thread_id}) for Instagram thread ${instagramThreadId}`);
-                return topic.message_thread_id;
-            } catch (error) {
-                logger.error('❌ Failed to create Telegram topic:', error.message);
-                return null;
-            } finally {
-                this.creatingTopics.delete(instagramThreadId);
-            }
-        })();
-        this.creatingTopics.set(instagramThreadId, creationPromise);
-        return await creationPromise;
-    }
-
-    escapeMarkdownV2(text) {
-        const specialChars = ['[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'];
-        let escapedText = text;
-        specialChars.forEach(char => {
-            const regex = new RegExp(`\\${char}`, 'g');
-            escapedText = escapedText.replace(regex, `\\${char}`);
+        // Topic doesn't exist, so clean up the mapping
+        logger.warn(`🗑️ Existing mapping for ${instagramThreadId} points to non-existent topic ${topicId}. Cleaning up.`);
+        this.chatMappings.delete(instagramThreadId);
+        await this.collection.deleteOne({ 
+            type: 'chat', 
+            'data.instagramThreadId': instagramThreadId 
         });
-        escapedText = escapedText.replace(/(?<!\\)_/g, '\\_');
-        escapedText = escapedText.replace(/(?<!\\)\*/g, '\\*');
-        return escapedText;
     }
-
+    
+    // If we're already creating a topic for this thread, wait for it
+    if (this.creatingTopics.has(instagramThreadId)) {
+        logger.debug(`⏳ Topic creation for ${instagramThreadId} already in progress, waiting...`);
+        return await this.creatingTopics.get(instagramThreadId);
+    }
+    
+    // Create a new topic
+    const creationPromise = (async () => {
+        if (!this.telegramChatId) {
+            logger.error('❌ Telegram chat ID not configured');
+            return null;
+        }
+        try {
+            let topicName = `Instagram Chat ${instagramThreadId.substring(0, 10)}...`;
+            let iconColor = 0x7ABA3C;
+            const userInfo = this.userMappings.get(senderUserId?.toString());
+            if (userInfo) {
+                topicName = `@${userInfo.username || userInfo.fullName || senderUserId}`;
+            } else if (senderUserId) {
+                topicName = `User ${senderUserId}`;
+                await this.saveUserMapping(senderUserId.toString(), {
+                    username: null,
+                    fullName: null,
+                    firstSeen: new Date(),
+                    messageCount: 0
+                });
+            }
+            const topic = await this.telegramBot.createForumTopic(this.telegramChatId, topicName, {
+                icon_color: iconColor
+            });
+            await this.saveChatMapping(instagramThreadId, topic.message_thread_id);
+            logger.info(`🆕 Created Telegram topic: "${topicName}" (ID: ${topic.message_thread_id}) for Instagram thread ${instagramThreadId}`);
+            return topic.message_thread_id;
+        } catch (error) {
+            logger.error('❌ Failed to create Telegram topic:', error.message);
+            return null;
+        } finally {
+            this.creatingTopics.delete(instagramThreadId);
+        }
+    })();
+    
+    this.creatingTopics.set(instagramThreadId, creationPromise);
+    return await creationPromise;
+}
     // --- Message Forwarding Logic ---
     async sendToTelegram(message) {
         if (!this.telegramBot || !this.enabled) return;
