@@ -14,6 +14,7 @@
   "license": "MIT",
   "dependencies": {
     "instagram-private-api": "^1.46.1",
+    "instagram_mqtt": "^0.1.9",
     "node-telegram-bot-api": "^0.64.0",
     "fs-extra": "^11.1.1",
     "axios": "^1.6.0",
