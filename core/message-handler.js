@@ -10,22 +10,27 @@ export class MessageHandler {
 
   async handleMessage(message) {
     try {
+      logger.info(`📨 Processing message: "${message.text}" from @${message.senderUsername}`);
+      
       // Process through modules for stats/logging
       message = await this.moduleManager.processMessage(message);
 
       // Handle commands INSTANTLY
       if (message.text?.startsWith('.')) {
+        logger.info(`⚡ Command detected: ${message.text}`);
         await this.handleCommand(message);
         return;
       }
 
       // Forward to Telegram if enabled
       if (this.telegramBridge?.enabled && config.telegram.enabled) {
+        logger.debug('Forwarding to Telegram...');
         await this.telegramBridge.sendToTelegram(message);
       }
 
     } catch (error) {
       logger.error('Message handling error:', error.message);
+      logger.debug('Full error stack:', error.stack);
     }
   }
 

@@ -16,7 +16,7 @@ export const logger = {
   },
   
   debug: (message, ...args) => {
-    if (process.env.LOG_LEVEL === 'debug') {
+    if (process.env.LOG_LEVEL === 'debug' || true) { // Always show debug for troubleshooting
       console.log(`[${new Date().toISOString()}] 🐛 ${message}`, ...args);
     }
   }

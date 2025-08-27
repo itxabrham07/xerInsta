@@ -162,6 +162,7 @@ class InstagramBot {
 
     // Handle direct messages
     this.ig.realtime.on('message', async (data) => {
+      this.log('DEBUG', 'Received message event:', JSON.stringify(data, null, 2));
       if (!data.message) {
         this.log('WARN', 'No message payload in event data');
         return;
@@ -175,6 +176,7 @@ class InstagramBot {
 
     // Handle other direct events
     this.ig.realtime.on('direct', async (data) => {
+      this.log('DEBUG', 'Received direct event:', JSON.stringify(data, null, 2));
       if (data.message && this.isNewMessageById(data.message.item_id)) {
         await this.handleMessage(data.message, data);
       } else {
@@ -218,9 +220,10 @@ class InstagramBot {
   isNewMessageById(messageId) {
     if (!messageId) {
       this.log('WARN', 'Missing message ID');
-      return true;
+      return false;
     }
     if (this.processedMessageIds.has(messageId)) {
+      this.log('DEBUG', `Message ${messageId} already processed`);
       return false;
     }
     this.processedMessageIds.add(messageId);
@@ -228,6 +231,7 @@ class InstagramBot {
       const first = this.processedMessageIds.values().next().value;
       this.processedMessageIds.delete(first);
     }
+    this.log('DEBUG', `New message ID: ${messageId}`);
     return true;
   }
 
@@ -260,8 +264,17 @@ class InstagramBot {
    */
   async handleMessage(message, eventData) {
     try {
+      this.log('DEBUG', 'Raw message received:', JSON.stringify(message, null, 2));
+      
       if (!message || !message.user_id || !message.item_id) {
         this.log('WARN', 'Received malformed message');
+        return;
+      }
+
+      // Skip messages from the bot itself
+      const botUserId = this.ig.state.cookieUserId;
+      if (message.user_id?.toString() === botUserId?.toString()) {
+        this.log('DEBUG', `Ignoring message from bot itself (${botUserId})`);
         return;
       }
 
@@ -291,11 +304,16 @@ class InstagramBot {
 
       this.log('INFO', `[${processedMessage.threadTitle}] New message from @${processedMessage.senderUsername}: "${processedMessage.text}"`);
 
+      // Add debug logging for handlers
+      this.log('DEBUG', `Processing message through ${this.messageHandlers.length} handlers`);
+      
       for (const handler of this.messageHandlers) {
+        this.log('DEBUG', 'Calling message handler...');
         await handler(processedMessage);
       }
     } catch (error) {
       this.log('ERROR', 'Error handling message:', error.message);
+      this.log('DEBUG', 'Full error stack:', error.stack);
     }
   }
 

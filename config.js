@@ -35,7 +35,7 @@ export const config = {
   },
   
   app: {
-    logLevel: 'info',
+    logLevel: 'debug',
     environment: 'development'
   }
 };
