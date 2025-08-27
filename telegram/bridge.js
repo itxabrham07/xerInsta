@@ -21,6 +21,7 @@ constructor() {
     this.topicVerificationCache = new Map();
     this.enabled = false;
     this.filters = new Set();
+    this.adminUserId = config.telegram?.adminUserId;
 }
 
     async initialize(instagramBotInstance) {
@@ -53,6 +54,7 @@ constructor() {
         this.setupInstagramHandlers();
 
         this.enabled = true;
+        await this.sendStartupMessage();
         logger.info('✅ Instagram-Telegram bridge initialized');
     } catch (error) {
         logger.error('❌ Failed to initialize Instagram-Telegram bridge:', error.message);
@@ -72,6 +74,22 @@ constructor() {
         } catch (error) {
             logger.error('❌ Failed to initialize database for Instagram bridge:', error.message);
             throw error;
+        }
+    }
+
+    async sendStartupMessage() {
+        try {
+            const message = `🚀 **Instagram Bridge Started**\n\n` +
+                `✅ Connected to Instagram: @${this.instagramBot.ig.state.cookieUsername || 'Unknown'}\n` +
+                `📱 Bridge Status: Active\n` +
+                `🛡️ Filters Active: ${this.filters.size}\n\n` +
+                `Use /help to see available commands`;
+            
+            if (this.adminUserId) {
+                await this.telegramBot.sendMessage(this.adminUserId, message, { parse_mode: 'Markdown' });
+            }
+        } catch (error) {
+            logger.error('❌ Failed to send startup message:', error.message);
         }
     }
 
@@ -161,11 +179,56 @@ constructor() {
         try {
             const filterDocs = await this.collection.find({ type: 'filter' }).toArray();
             for (const doc of filterDocs) {
-                this.filters.add(doc.word);
+                this.filters.add(doc.data.word);
             }
             logger.info(`✅ Loaded ${this.filters.size} filters from DB`);
         } catch (error) {
             logger.error('❌ Failed to load filters:', error.message);
+        }
+    }
+
+    async saveFilterToDb(word) {
+        if (!this.collection) return;
+        try {
+            await this.collection.updateOne(
+                { type: 'filter', 'data.word': word },
+                {
+                    $set: {
+                        type: 'filter',
+                        data: {
+                            word: word,
+                            createdAt: new Date()
+                        }
+                    }
+                },
+                { upsert: true }
+            );
+            this.filters.add(word);
+            logger.info(`✅ Added filter: "${word}"`);
+        } catch (error) {
+            logger.error('❌ Failed to save filter:', error.message);
+        }
+    }
+
+    async removeFilterFromDb(word) {
+        if (!this.collection) return;
+        try {
+            await this.collection.deleteOne({ type: 'filter', 'data.word': word });
+            this.filters.delete(word);
+            logger.info(`✅ Removed filter: "${word}"`);
+        } catch (error) {
+            logger.error('❌ Failed to remove filter:', error.message);
+        }
+    }
+
+    async clearAllFilters() {
+        if (!this.collection) return;
+        try {
+            await this.collection.deleteMany({ type: 'filter' });
+            this.filters.clear();
+            logger.info('✅ Cleared all filters');
+        } catch (error) {
+            logger.error('❌ Failed to clear filters:', error.message);
         }
     }
 
@@ -281,7 +344,7 @@ async sendToTelegram(message) {
 
         // Filter messages based on content
         const textLower = (message.text || '').toLowerCase().trim();
-        for (const word of this.filters) { // Corrected syntax: removed erroneous "-"
+        for (const word of this.filters) {
             if (textLower.startsWith(word)) {
                 logger.info(`🛑 Blocked Instagram ➝ Telegram message due to filter "${word}": ${message.text}`);
                 return;
@@ -406,6 +469,49 @@ async handleInstagramVoice(message, topicId) {
     async setupTelegramHandlers() {
         if (!this.telegramBot) return;
 
+        // Handle commands
+        this.telegramBot.onText(/\/start/, this.wrapHandler(async (msg) => {
+            if (msg.chat.type === 'private') {
+                await this.handleStartCommand(msg);
+            }
+        }));
+
+        this.telegramBot.onText(/\/help/, this.wrapHandler(async (msg) => {
+            if (msg.chat.type === 'private') {
+                await this.handleHelpCommand(msg);
+            }
+        }));
+
+        this.telegramBot.onText(/\/status/, this.wrapHandler(async (msg) => {
+            if (msg.chat.type === 'private' && this.isAdmin(msg.from.id)) {
+                await this.handleStatusCommand(msg);
+            }
+        }));
+
+        this.telegramBot.onText(/\/filter (.+)/, this.wrapHandler(async (msg, match) => {
+            if (msg.chat.type === 'private' && this.isAdmin(msg.from.id)) {
+                await this.handleFilterCommand(msg, match[1]);
+            }
+        }));
+
+        this.telegramBot.onText(/\/unfilter (.+)/, this.wrapHandler(async (msg, match) => {
+            if (msg.chat.type === 'private' && this.isAdmin(msg.from.id)) {
+                await this.handleUnfilterCommand(msg, match[1]);
+            }
+        }));
+
+        this.telegramBot.onText(/\/filters/, this.wrapHandler(async (msg) => {
+            if (msg.chat.type === 'private' && this.isAdmin(msg.from.id)) {
+                await this.handleFiltersCommand(msg);
+            }
+        }));
+
+        this.telegramBot.onText(/\/clearfilters/, this.wrapHandler(async (msg) => {
+            if (msg.chat.type === 'private' && this.isAdmin(msg.from.id)) {
+                await this.handleClearFiltersCommand(msg);
+            }
+        }));
+
         this.telegramBot.on('message', this.wrapHandler(async (msg) => {
             if (
                 (msg.chat.type === 'supergroup' || msg.chat.type === 'group') &&
@@ -427,6 +533,121 @@ async handleInstagramVoice(message, topicId) {
         });
 
         logger.info('📱 Instagram-Telegram message handlers set up');
+    }
+
+    async handleStartCommand(msg) {
+        const welcomeMessage = `🤖 **Instagram Bridge Bot**\n\n` +
+            `Welcome! This bot bridges Instagram DMs to Telegram.\n\n` +
+            `**Status:** ${this.enabled ? '✅ Active' : '❌ Inactive'}\n` +
+            `**Instagram:** @${this.instagramBot?.ig?.state?.cookieUsername || 'Not connected'}\n\n` +
+            `Use /help to see available commands.`;
+        
+        await this.telegramBot.sendMessage(msg.chat.id, welcomeMessage, { parse_mode: 'Markdown' });
+    }
+
+    async handleHelpCommand(msg) {
+        let helpMessage = `📋 **Available Commands**\n\n` +
+            `🔹 /start - Show welcome message\n` +
+            `🔹 /help - Show this help\n`;
+        
+        if (this.isAdmin(msg.from.id)) {
+            helpMessage += `\n**Admin Commands:**\n` +
+                `🔹 /status - Show bridge status\n` +
+                `🔹 /filter <word> - Add message filter\n` +
+                `🔹 /unfilter <word> - Remove message filter\n` +
+                `🔹 /filters - View all filters\n` +
+                `🔹 /clearfilters - Clear all filters\n\n` +
+                `**Note:** Filtered messages starting with the filter word won't be forwarded.`;
+        }
+        
+        await this.telegramBot.sendMessage(msg.chat.id, helpMessage, { parse_mode: 'Markdown' });
+    }
+
+    async handleStatusCommand(msg) {
+        const uptime = Date.now() - (this.instagramBot?.startTime || Date.now());
+        const uptimeStr = this.formatUptime(uptime);
+        
+        const statusMessage = `📊 **Bridge Status**\n\n` +
+            `🔗 **Connection:** ${this.enabled ? '✅ Active' : '❌ Inactive'}\n` +
+            `📱 **Instagram:** @${this.instagramBot?.ig?.state?.cookieUsername || 'Unknown'}\n` +
+            `⏱️ **Uptime:** ${uptimeStr}\n` +
+            `💬 **Active Chats:** ${this.chatMappings.size}\n` +
+            `👥 **Known Users:** ${this.userMappings.size}\n` +
+            `🛡️ **Active Filters:** ${this.filters.size}\n` +
+            `🗄️ **Database:** ${this.collection ? '✅ Connected' : '❌ Disconnected'}`;
+        
+        await this.telegramBot.sendMessage(msg.chat.id, statusMessage, { parse_mode: 'Markdown' });
+    }
+
+    async handleFilterCommand(msg, word) {
+        const filterWord = word.toLowerCase().trim();
+        if (!filterWord) {
+            await this.telegramBot.sendMessage(msg.chat.id, '❌ Please provide a word to filter');
+            return;
+        }
+        
+        if (this.filters.has(filterWord)) {
+            await this.telegramBot.sendMessage(msg.chat.id, `⚠️ Filter "${filterWord}" already exists`);
+            return;
+        }
+        
+        await this.saveFilterToDb(filterWord);
+        await this.telegramBot.sendMessage(msg.chat.id, `✅ Added filter: "${filterWord}"\n\nMessages starting with this word will be blocked.`);
+    }
+
+    async handleUnfilterCommand(msg, word) {
+        const filterWord = word.toLowerCase().trim();
+        if (!filterWord) {
+            await this.telegramBot.sendMessage(msg.chat.id, '❌ Please provide a word to unfilter');
+            return;
+        }
+        
+        if (!this.filters.has(filterWord)) {
+            await this.telegramBot.sendMessage(msg.chat.id, `⚠️ Filter "${filterWord}" doesn't exist`);
+            return;
+        }
+        
+        await this.removeFilterFromDb(filterWord);
+        await this.telegramBot.sendMessage(msg.chat.id, `✅ Removed filter: "${filterWord}"`);
+    }
+
+    async handleFiltersCommand(msg) {
+        if (this.filters.size === 0) {
+            await this.telegramBot.sendMessage(msg.chat.id, '📝 No filters configured');
+            return;
+        }
+        
+        const filterList = Array.from(this.filters).map((filter, index) => `${index + 1}. "${filter}"`).join('\n');
+        const message = `🛡️ **Active Filters (${this.filters.size})**\n\n${filterList}\n\n*Messages starting with these words will be blocked.*`;
+        
+        await this.telegramBot.sendMessage(msg.chat.id, message, { parse_mode: 'Markdown' });
+    }
+
+    async handleClearFiltersCommand(msg) {
+        if (this.filters.size === 0) {
+            await this.telegramBot.sendMessage(msg.chat.id, '📝 No filters to clear');
+            return;
+        }
+        
+        const count = this.filters.size;
+        await this.clearAllFilters();
+        await this.telegramBot.sendMessage(msg.chat.id, `✅ Cleared ${count} filters`);
+    }
+
+    isAdmin(userId) {
+        return userId.toString() === this.adminUserId?.toString();
+    }
+
+    formatUptime(ms) {
+        const seconds = Math.floor(ms / 1000);
+        const minutes = Math.floor(seconds / 60);
+        const hours = Math.floor(minutes / 60);
+        const days = Math.floor(hours / 24);
+        
+        if (days > 0) return `${days}d ${hours % 24}h ${minutes % 60}m`;
+        if (hours > 0) return `${hours}h ${minutes % 60}m`;
+        if (minutes > 0) return `${minutes}m ${seconds % 60}s`;
+        return `${seconds}s`;
     }
 
     wrapHandler(handler) {
