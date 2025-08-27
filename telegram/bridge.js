@@ -245,6 +245,15 @@ async sendToTelegram(message) {
     if (!this.telegramBot || !this.enabled) return;
 
     try {
+        // Get the bot's own Instagram user ID
+        const botUserId = this.instagramBot.ig.state.cookieUserId;
+        
+        // Skip messages sent by the bot itself
+        if (message.senderId.toString() === botUserId.toString()) {
+            logger.debug(`🤖 Ignoring message from bot itself (Instagram user ID: ${botUserId})`);
+            return;
+        }
+
         const instagramThreadId = message.threadId;
         const senderUserId = message.senderId;
 
